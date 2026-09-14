@@ -105,7 +105,19 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         lines.append("")
         lines.append(f"[CHECK {check.check_id}] {check.name}")
         for label, value in check.details:
-            lines.append(f"   -> {label:<30}: {value}")
+            if not value:
+                if label.startswith("---"):
+                    lines.append(f"\n   {label}")
+                elif label.startswith("["):
+                    lines.append(f"\n   -> {label}")
+                else:
+                    lines.append(f"   -> {label}")
+            elif label.startswith("      * ") or label.startswith("   * "):
+                lines.append(f"{label:<36}: {value}")
+            elif label.startswith("[Kernel]"):
+                lines.append(f"\n   -> {label:<30}: {value}")
+            else:
+                lines.append(f"   -> {label:<30}: {value}")
         lines.append(f"   -> {'Verdict':<30}: {Status.marker(check.status)}")
         if check.summary:
             for chunk in _wrap(check.summary, WIDTH - 6):

@@ -345,7 +345,11 @@ class GatewayDiagnosticClient:
         # YARN returns {"apps": null} when nothing matches.
         if not apps:
             return []
-        return apps.get("app", []) or []
+        raw_apps = apps.get("app", []) or []
+        if states:
+            allowed = {s.strip().upper() for s in states.split(",") if s.strip()}
+            return [a for a in raw_apps if a.get("state", "").upper() in allowed]
+        return raw_apps
 
     # ------------------------------------------------------------------
     # Jupyter Kernel Gateway (via Component Gateway)

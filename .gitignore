@@ -11,3 +11,4 @@ venv/
 .ipynb_checkpoints/
 *.log
 .jetski/
+.python-version

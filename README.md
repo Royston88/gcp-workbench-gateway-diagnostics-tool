@@ -40,20 +40,56 @@ gcloud dataproc clusters describe <CLUSTER> --region=<REGION> \
 
 Expect `True`. If empty or `False`, Checks 1 and 2 will report `SKIPPED`.
 
-**Grant the identity running the notebook these roles:**
+### Required IAM Permissions & Technical Rationale
 
-| Role | Needed for |
-|---|---|
-| `roles/dataproc.viewer` | Read cluster configuration (all checks) |
-| `roles/dataproc.editor` | Reach YARN via Component Gateway — supplies `dataproc.clusters.use` (Checks 1, 2, 4) |
-| `roles/logging.viewer` | Read gateway logs (Check 3) |
+The required permissions must be granted to the **identity executing the script**:
+* **Inside Vertex AI Workbench (notebook cell or terminal):** Grant the roles to the **Workbench Instance Service Account** (e.g. `ds-user-1-svc@<PROJECT>.iam.gserviceaccount.com`), or to the end-user identity if user credential delegation is enabled.
+* **Outside Workbench (Cloud Shell, Cloudtop, local developer machine):** Grant the roles to the authenticating user account (`gcloud auth login`) or service account (`GOOGLE_APPLICATION_CREDENTIALS`).
 
-On Vertex AI Workbench the relevant identity is the **instance service account**, not your user account:
+#### Permissions Matrix
+
+| Predefined Role | Minimum IAM Permission | Target API / Endpoint Called | Technical Rationale & Failure Mode |
+|---|---|---|---|
+| `roles/dataproc.viewer` | `dataproc.clusters.get` | `GET https://dataproc.googleapis.com/v1/projects/{project}/regions/{region}/clusters/{cluster}` | **Cluster Metadata & Endpoint Resolution:** Discovers cluster state, hardware capacity, cluster software properties (`softwareConfig.properties` for YARN and Jupyter settings), and reads `config.endpointConfig.httpPorts` to discover dynamic reverse-proxy Component Gateway URLs.<br><br>*Failure Mode:* If missing, the script halts immediately with `AccessDenied` (`HTTP 403`). |
+| `roles/dataproc.editor` *(or custom role)* | `dataproc.clusters.use` | HTTP requests routed via `https://<hash>.dataproc.googleusercontent.com/gateway/default/...` | **Component Gateway Ingress:** Authorizes HTTP requests routed through Google Cloud Component Gateway to access cluster-internal Web UIs without VPN or SSH tunnels.<br>Specifically accesses:<br>1. **YARN ResourceManager REST API** (`/ws/v1/cluster/metrics`, `/ws/v1/cluster/scheduler`, `/ws/v1/cluster/apps`) for Checks 1, 2, and 4.<br>2. **Jupyter Kernel Gateway REST API** (`/api/kernels`) for Check 1.<br><br>*Key Gotcha:* `roles/dataproc.viewer` **does not** include `dataproc.clusters.use`. Accessing Component Gateway endpoints with only `dataproc.viewer` results in `HTTP 403 Forbidden`. |
+| `roles/logging.viewer` | `logging.entries.list` | `POST https://logging.googleapis.com/v2/entries:list` | **Log Inspection:** Queries Cloud Logging for `resource.type="cloud_dataproc_cluster"` and `log_name=.../jupyter_kernel_gateway` to detect kernel launch timeout exceptions, cold-start latency, and stack traces (Check 3).<br><br>*Failure Mode:* If missing, Check 3 degrades gracefully to `[?] SKIPPED`. |
+
+#### Quick Grant (Predefined Roles)
 
 ```bash
+# For Vertex AI Workbench instance service account:
 gcloud projects add-iam-policy-binding <PROJECT> \
-    --member="serviceAccount:<SA_EMAIL>" \
+    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
     --role="roles/dataproc.viewer"
+
+gcloud projects add-iam-policy-binding <PROJECT> \
+    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
+    --role="roles/dataproc.editor"
+
+gcloud projects add-iam-policy-binding <PROJECT> \
+    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
+    --role="roles/logging.viewer"
+```
+
+#### Least-Privilege Custom Role (Enterprise Standard)
+
+In security-conscious enterprise environments, granting `roles/dataproc.editor` may violate least-privilege compliance, as `dataproc.editor` permits cluster mutation and job submission. To provide strictly read-only diagnostic access, deploy this minimal Custom IAM Role:
+
+```bash
+gcloud iam roles create DataprocGatewayDiagnosticsAuditor \
+    --project=<PROJECT_ID> \
+    --title="Dataproc Gateway Diagnostics Auditor" \
+    --description="Read-only permissions for diagnosing Jupyter Kernel Gateway and YARN via Component Gateway" \
+    --permissions="dataproc.clusters.get,dataproc.clusters.use,logging.entries.list" \
+    --stage="GA"
+```
+
+And bind it to the Workbench Service Account or user:
+
+```bash
+gcloud projects add-iam-policy-binding <PROJECT_ID> \
+    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
+    --role="projects/<PROJECT_ID>/roles/DataprocGatewayDiagnosticsAuditor"
 ```
 
 > [!NOTE]
@@ -168,8 +204,77 @@ Exit code `1`. Reading it line by line:
 | `Cluster memory : 16.1 GB free` | **The decisive signal.** Queuing with abundant free memory means an *admission limit*, not a capacity shortage. |
 | `<-- PRIMARY ROOT CAUSE` | Fix this before anything else. |
 
-> [!CAUTION]
-> The instinctive response — add workers — **will not help**. More memory does not raise the AM budget if the percentage stays at `0.1`. You would pay for nodes and remain blocked.
+---
+
+## Expected output — Case C: Zombie / idle kernels & orphaned YARN apps
+
+```
+[CHECK 1] Zombie / Idle Kernel Sessions
+   -> Active kernels                : 1
+   -> Busy (executing)              : 0
+   -> Idle > 2h                     : 1
+   -> Longest idle                  : 12d 11h 59m
+   -> Running YARN applications     : 2 (older than 24h: 2)
+
+   --- Configuration Status ---
+   -> Gateway cull_idle_timeout     : Not configured (disabled)
+   -> Gateway cull_connected        : False (open browser tabs block culling)
+   -> YARN Application Lifetime     : UNLIMITED (no automatic reaper)
+
+   --- Active Kernel Gateway Sessions ---
+
+   -> [Kernel] 64fa53be...          : pyspark_yarn
+      * State                       : idle (idle for 12d 11h 59m)
+      * Active Connections          : 4 connected WebSocket client(s)
+      * Associated YARN App         : application_1779383468488_0011
+
+   --- Running YARN Applications ---
+
+   -> [Active Gateway Session] application_1779383468488_0011
+      * Name                        : 64fa53be-9cd7-4886-b382-08aac85d4eb2
+      * User                        : ds-user-1-svc
+      * Started                     : 2026-09-01 10:18:53 UTC (13d 3h 20m ago)
+      * Allocation                  : 4.8 GB, 3 vCores, 2 container(s)
+      * Host Node                   : pyspark-cluster...-w-1:8044
+
+   -> [ORPHANED YARN APP] application_1779383468488_0005
+      * Name                        : 67913c09-b89b-4f8b-9d48-e44954a67643
+      * User                        : ds-user-1-svc
+      * Started                     : 2026-09-01 09:31:27 UTC (13d 4h 8m ago)
+      * Allocation                  : 4.8 GB, 3 vCores, 2 container(s)
+      * Host Node                   : pyspark-cluster...-w-0:8044
+      * Status                      : No active gateway session; driver still alive
+   -> Verdict                       : [✗] FAIL
+      1 idle kernel(s) and 2 long-running YARN application(s)
+      (including 1 orphaned app) are holding ApplicationMaster
+      capacity.
+
+=================================================================
+   Check 1  Zombie / Idle Kernel Sessions    : [✗] FAIL   <-- PRIMARY ROOT CAUSE
+   Check 2  YARN ApplicationMaster Capacity  : [✓] PASS
+   OVERALL                                   : [✗] FAIL
+=================================================================
+             RECOMMENDED REMEDIATION (priority order)
+=================================================================
+   1. Enable idle kernel culling on the Kernel Gateway
+      (cull_idle_timeout=7200, cull_interval=300,
+      cull_connected=True).
+   2. Kill 1 orphaned YARN application(s): yarn application
+      -kill <APP_ID> or via YARN ResourceManager Web UI.
+   3. Shut down abandoned kernels: JupyterLab > Running
+      Terminals and Kernels.
+=================================================================
+```
+
+Exit code `1`. Reading it line by line:
+
+| Line | Why it matters |
+|---|---|
+| `Gateway cull_connected : False` | Open browser tabs block culling even if `cull_idle_timeout` is configured. |
+| `YARN Application Lifetime : UNLIMITED` | YARN has no lifetime monitor active to reap long-abandoned interactive drivers. |
+| `[Active Gateway Session]` | PySpark session initiated from Workbench, currently idle with WebSocket connections holding the AM slot. |
+| `[ORPHANED YARN APP]` | A Spark driver running on YARN with **no active kernel** on the gateway. Left behind after a gateway crash or ungraceful shutdown. |
+| `Kill orphaned YARN application` | Orphaned apps cannot be culled through Jupyter; they must be terminated via `yarn application -kill <APP_ID>`. |
 
 ---
 
@@ -186,7 +291,7 @@ Exit code `1`. Reading it line by line:
 
 | Finding | Fix |
 |---|---|
-| **Check 1 FAIL** — idle kernels holding AMs | Enable culling: `c.MappingKernelManager.cull_idle_timeout = 7200`, `cull_interval = 300`, `cull_connected = True`, `cull_busy = False` |
+| **Check 1 FAIL** — idle kernels holding AMs | Enable culling: `c.MappingKernelManager.cull_idle_timeout = 7200`, `cull_interval = 300`, `cull_connected = True`, `cull_busy = False`; Kill orphaned YARN applications: `yarn application -kill <APP_ID>` |
 | **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` |
 | **Check 3 FAIL** — launch timeouts | Raise the timeout: `c.GatewayProvisionerBase.default_kernel_launch_timeout = 600`. A mitigation, not a cure — resolve Check 2 first |
 | **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers |

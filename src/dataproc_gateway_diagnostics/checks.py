@@ -100,6 +100,33 @@ def parse_timestamp(value: str) -> Optional[datetime]:
     return parsed
 
 
+UUID_REGEX = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def format_epoch_ms(epoch_ms: Any) -> str:
+    """Format epoch millisecond timestamp as 'YYYY-MM-DD HH:MM:SS UTC'."""
+    try:
+        sec = float(epoch_ms) / 1000.0
+        dt = datetime.fromtimestamp(sec, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, TypeError, OSError):
+        return "unknown"
+
+
+def shorten_node_address(addr: str) -> str:
+    """Shorten node FQDN to hostname:port or prefix...-w-N:port."""
+    if not addr:
+        return "unknown"
+    host_part, _, port = addr.partition(":")
+    short_host = host_part.split(".")[0]
+    if len(short_host) > 28 and "-w-" in short_host:
+        prefix, _, worker = short_host.rpartition("-w-")
+        short_host = f"{prefix[:15]}...-w-{worker}"
+    return f"{short_host}:{port}" if port else short_host
+
+
 def iter_leaf_queues(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Depth-first collection of capacity-scheduler leaf queues."""
     leaves: List[Dict[str, Any]] = []
@@ -160,7 +187,73 @@ def check_kernel_sessions(
     busy = 0
     max_idle = 0.0
 
+    # Fetch running YARN applications (filtered for RUNNING state)
+    running_apps: List[Dict[str, Any]] = []
+    apps_error = None
+    try:
+        running_apps = client.yarn_apps(states="RUNNING")
+    except (AccessDenied, NotFound, DiagnosticError) as exc:
+        apps_error = str(exc)
+
+    # Fetch cluster properties for culling configuration
+    props: Dict[str, Any] = {}
+    try:
+        props = client.cluster_properties()
+    except (AccessDenied, NotFound, DiagnosticError):
+        pass
+
+    # Extract culling parameters
+    cull_idle_timeout: Optional[int] = None
+    cull_connected = False
+    cull_interval: Optional[int] = None
+    cull_busy = False
+
+    for k, v in props.items():
+        k_lower = k.lower()
+        if (
+            "cull_idle_timeout" in k_lower
+            or "cull.idle.timeout" in k_lower
+            or "cull.idle-timeout" in k_lower
+        ):
+            try:
+                cull_idle_timeout = int(v)
+            except (ValueError, TypeError):
+                pass
+        elif "cull_connected" in k_lower or "cull.connected" in k_lower:
+            cull_connected = str(v).strip().lower() in ("true", "1", "yes")
+        elif "cull_interval" in k_lower or "cull.interval" in k_lower:
+            try:
+                cull_interval = int(v)
+            except (ValueError, TypeError):
+                pass
+        elif "cull_busy" in k_lower or "cull.busy" in k_lower:
+            cull_busy = str(v).strip().lower() in ("true", "1", "yes")
+
+    # Detect YARN Application Lifetime monitor
+    is_yarn_unlimited = True
+    yarn_lifetime_val = "UNLIMITED (no automatic reaper)"
+    yarn_prop_lifetime = props.get(
+        "yarn:yarn.resourcemanager.app.max-lifetime"
+    ) or props.get("yarn:yarn.resourcemanager.app.default-lifetime")
+    if yarn_prop_lifetime and yarn_prop_lifetime != "-1":
+        is_yarn_unlimited = False
+        yarn_lifetime_val = f"{yarn_prop_lifetime}s"
+    else:
+        for app in running_apps:
+            timeouts = app.get("timeouts", {}).get("timeout", [])
+            for t in timeouts:
+                if t.get("type") == "LIFETIME":
+                    exp = t.get("expiryTime")
+                    if exp and exp != "UNLIMITED":
+                        is_yarn_unlimited = False
+                        yarn_lifetime_val = str(exp)
+
+    # Build active kernel IDs and kernels_detail
+    active_kernel_ids = {k.get("id", "") for k in kernels if k.get("id")}
+    kernels_detail: List[Dict[str, Any]] = []
+
     for kernel in kernels:
+        k_id = kernel.get("id", "?")
         state = kernel.get("execution_state", "unknown")
         if state == "busy":
             busy += 1
@@ -168,35 +261,162 @@ def check_kernel_sessions(
         idle_seconds = (now - last).total_seconds() if last else 0.0
         max_idle = max(max_idle, idle_seconds)
         if last and (now - last) > idle_cutoff and state != "busy":
-            idle_kernels.append((kernel.get("id", "?"), idle_seconds, state))
+            idle_kernels.append((k_id, idle_seconds, state))
 
-    # Long-lived YARN applications are the resource these kernels hold on to.
+        # Check if any running YARN app corresponds to this kernel
+        assoc_app_id: Optional[str] = None
+        for app in running_apps:
+            app_name = app.get("name", "")
+            if k_id in app_name or (
+                UUID_REGEX.match(app_name) and app_name.lower() == k_id.lower()
+            ):
+                assoc_app_id = app.get("id")
+                break
+
+        kernels_detail.append(
+            {
+                "id": k_id,
+                "name": kernel.get("name", "unknown"),
+                "execution_state": state,
+                "last_activity": kernel.get("last_activity", ""),
+                "idle_seconds": idle_seconds,
+                "connections": int(kernel.get("connections", 0) or 0),
+                "associated_yarn_app": assoc_app_id,
+            }
+        )
+
+    # Build YARN applications detail and classify orphans
+    yarn_apps_detail: List[Dict[str, Any]] = []
     long_running: List[Tuple[str, float]] = []
-    apps_error = None
-    try:
-        for app in client.yarn_apps(states="RUNNING"):
-            elapsed = float(app.get("elapsedTime", 0)) / 1000.0
-            if elapsed > app_age_hours * 3600:
-                long_running.append((app.get("id", "?"), elapsed))
-    except (AccessDenied, NotFound, DiagnosticError) as exc:
-        apps_error = str(exc)
+    orphaned_count = 0
 
+    for app in running_apps:
+        app_id = app.get("id", "?")
+        app_name = app.get("name", "")
+        elapsed = float(app.get("elapsedTime", 0)) / 1000.0
+        if elapsed > app_age_hours * 3600:
+            long_running.append((app_id, elapsed))
+
+        started_ms = app.get("startedTime")
+        started_str = format_epoch_ms(started_ms)
+        allocated_mb = int(app.get("allocatedMB", 0) or 0)
+        vcores = int(app.get("allocatedVCores", 0) or 0)
+        containers = int(app.get("runningContainers", 0) or 0)
+        host_addr = (
+            app.get("amHostHttpAddress", "")
+            or app.get("host", "")
+            or app.get("nodeHttpAddress", "")
+        )
+        if app.get("rpcPort") and ":" not in host_addr:
+            host_addr = f"{host_addr}:{app.get('rpcPort')}"
+        host_short = shorten_node_address(host_addr)
+
+        # Classification
+        matched_kernel_id: Optional[str] = None
+        for k_id in active_kernel_ids:
+            if k_id in app_name or (
+                UUID_REGEX.match(app_name) and app_name.lower() == k_id.lower()
+            ):
+                matched_kernel_id = k_id
+                break
+
+        if matched_kernel_id:
+            app_type = "Active Gateway Session"
+            is_orphaned = False
+        elif UUID_REGEX.match(app_name):
+            app_type = "ORPHANED YARN APP"
+            is_orphaned = True
+            orphaned_count += 1
+        else:
+            app_type = "Standalone YARN App"
+            is_orphaned = False
+
+        yarn_apps_detail.append(
+            {
+                "id": app_id,
+                "name": app_name,
+                "user": app.get("user", "unknown"),
+                "state": app.get("state", "RUNNING"),
+                "started_time": started_str,
+                "elapsed_seconds": elapsed,
+                "allocated_mb": allocated_mb,
+                "allocated_vcores": vcores,
+                "running_containers": containers,
+                "host": host_addr,
+                "host_short": host_short,
+                "app_type": app_type,
+                "is_orphaned": is_orphaned,
+                "associated_kernel_id": matched_kernel_id,
+            }
+        )
+
+    # Populate result details
     result.add("Active kernels", len(kernels))
     result.add("Busy (executing)", busy)
     result.add(f"Idle > {idle_hours:g}h", len(idle_kernels))
     result.add("Longest idle", humanize_duration(max_idle) if kernels else "n/a")
     if apps_error:
-        result.add("Long-running YARN apps", f"unavailable ({apps_error[:60]})")
+        result.add("Running YARN applications", f"unavailable ({apps_error[:60]})")
     else:
-        result.add(f"YARN apps older than {app_age_hours:g}h", len(long_running))
-
-    for kernel_id, idle_seconds, state in sorted(
-        idle_kernels, key=lambda item: -item[1]
-    )[:5]:
         result.add(
-            f"  idle kernel {kernel_id[:8]}",
-            f"{humanize_duration(idle_seconds)} (state={state})",
+            "Running YARN applications",
+            f"{len(running_apps)} (older than {app_age_hours:g}h: {len(long_running)})",
         )
+
+    # Configuration Status
+    result.add("--- Configuration Status ---", "")
+    result.add(
+        "Gateway cull_idle_timeout",
+        f"{cull_idle_timeout}s" if cull_idle_timeout else "Not configured (disabled)",
+    )
+    result.add(
+        "Gateway cull_connected",
+        f"{cull_connected}"
+        + (
+            " (open browser tabs block culling)"
+            if not cull_connected
+            else " (active)"
+        ),
+    )
+    result.add("YARN Application Lifetime", yarn_lifetime_val)
+
+    # Active Kernel Gateway Sessions
+    if kernels_detail:
+        result.add("--- Active Kernel Gateway Sessions ---", "")
+        for kd in kernels_detail:
+            k_id_short = kd["id"][:8] if len(kd["id"]) > 8 else kd["id"]
+            result.add(f"[Kernel] {k_id_short}...", kd["name"])
+            result.add(
+                "      * State",
+                f"{kd['execution_state']} (idle for {humanize_duration(kd['idle_seconds'])})",
+            )
+            result.add(
+                "      * Active Connections",
+                f"{kd['connections']} connected WebSocket client(s)",
+            )
+            assoc = kd.get("associated_yarn_app") or "None (launching or non-YARN)"
+            result.add("      * Associated YARN App", assoc)
+
+    # Running YARN Applications
+    if yarn_apps_detail:
+        result.add("--- Running YARN Applications ---", "")
+        for ad in yarn_apps_detail:
+            result.add(f"[{ad['app_type']}] {ad['id']}", "")
+            result.add("      * Name", ad["name"])
+            result.add("      * User", ad["user"])
+            result.add(
+                "      * Started",
+                f"{ad['started_time']} ({humanize_duration(ad['elapsed_seconds'])} ago)",
+            )
+            result.add(
+                "      * Allocation",
+                f"{humanize_mb(ad['allocated_mb'])}, {ad['allocated_vcores']} vCores, {ad['running_containers']} container(s)",
+            )
+            result.add("      * Host Node", ad["host_short"])
+            if ad["is_orphaned"]:
+                result.add(
+                    "      * Status", "No active gateway session; driver still alive"
+                )
 
     result.metrics = {
         "active_kernels": len(kernels),
@@ -204,21 +424,49 @@ def check_kernel_sessions(
         "idle_kernels": len(idle_kernels),
         "idle_threshold_hours": idle_hours,
         "max_idle_seconds": max_idle,
+        "running_yarn_apps": len(running_apps),
         "long_running_apps": len(long_running),
+        "orphaned_yarn_apps": orphaned_count,
         "app_age_threshold_hours": app_age_hours,
+        "culling_config": {
+            "cull_idle_timeout": cull_idle_timeout,
+            "cull_connected": cull_connected,
+            "cull_interval": cull_interval,
+            "cull_busy": cull_busy,
+        },
+        "yarn_lifetime_config": {
+            "expiry_time": yarn_lifetime_val,
+            "is_unlimited": is_yarn_unlimited,
+        },
+        "kernels_detail": kernels_detail,
+        "yarn_apps_detail": yarn_apps_detail,
     }
 
-    if idle_kernels or long_running:
+    remediation = [
+        "Enable idle kernel culling on the Kernel Gateway "
+        "(cull_idle_timeout=7200, cull_interval=300, cull_connected=True).",
+    ]
+    if orphaned_count > 0:
+        remediation.append(
+            f"Kill {orphaned_count} orphaned YARN application(s): "
+            "yarn application -kill <APP_ID> or via YARN ResourceManager Web UI."
+        )
+    remediation.append(
+        "Shut down abandoned kernels: JupyterLab > Running Terminals and Kernels."
+    )
+
+    if idle_kernels or long_running or orphaned_count > 0:
         result.status = Status.FAIL
+        orphan_phrase = (
+            f" (including {orphaned_count} orphaned app{'s' if orphaned_count > 1 else ''})"
+            if orphaned_count
+            else ""
+        )
         result.summary = (
             f"{len(idle_kernels)} idle kernel(s) and {len(long_running)} long-running "
-            "YARN application(s) are holding ApplicationMaster capacity."
+            f"YARN application(s){orphan_phrase} are holding ApplicationMaster capacity."
         )
-        result.remediation = [
-            "Enable idle kernel culling on the Kernel Gateway "
-            "(cull_idle_timeout=7200, cull_interval=300, cull_connected=True).",
-            "Shut down abandoned kernels: JupyterLab > Running Terminals and Kernels.",
-        ]
+        result.remediation = remediation
     elif not kernels:
         result.status = Status.PASS
         result.summary = "No active kernel sessions on the gateway."
@@ -282,6 +530,7 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
             "max_applications_per_user": queue.get("maxApplicationsPerUser"),
             "user_limit_factor": queue.get("userLimitFactor"),
             "user_am_limit_mb": _resource_mb(queue.get("userAMResourceLimit")),
+            "raw_queue": queue,
         }
         queue_rows.append(row)
         if worst is None or (row["saturation"], row["num_pending"]) > (
@@ -293,6 +542,24 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
     assert worst is not None
     saturation = worst["saturation"]
     pending = worst["num_pending"]
+
+    # Parse active users in the queue
+    users_data = (worst.get("raw_queue", {}) or {}).get("users", {}).get("user", [])
+    if isinstance(users_data, dict):
+        users_data = [users_data]
+    active_users: List[Dict[str, Any]] = []
+    for u in users_data:
+        num_act = int(u.get("numActiveApplications", 0) or 0)
+        num_pend = int(u.get("numPendingApplications", 0) or 0)
+        if num_act > 0 or num_pend > 0:
+            active_users.append(
+                {
+                    "username": u.get("username", "?"),
+                    "active_apps": num_act,
+                    "pending_apps": num_pend,
+                    "am_used_mb": _resource_mb(u.get("AMResourceUsed")) or 0,
+                }
+            )
 
     # The decisive signature: applications are queued while the cluster still
     # has free memory, which means admission control -- not genuine capacity --
@@ -315,18 +582,28 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
     )
     result.add("Applications ACTIVE", worst["num_active"])
     result.add("Applications PENDING (ACCEPTED)", pending)
+    if active_users:
+        user_summaries = [
+            f"{u['username']} ({u['active_apps']} app(s), AM: {humanize_mb(u['am_used_mb'])})"
+            for u in active_users
+        ]
+        result.add("Active queue user(s)", ", ".join(user_summaries))
     result.add(
         "Cluster memory",
         f"{humanize_mb(allocated_mb)} used / {humanize_mb(total_mb)} total"
         f"  ({humanize_mb(available_mb)} free)",
     )
-    result.add("maxApplications / per user", 
-               f"{worst['max_applications']} / {worst['max_applications_per_user']}")
+    result.add(
+        "maxApplications / per user",
+        f"{worst['max_applications']} / {worst['max_applications_per_user']}",
+    )
     result.add("userLimitFactor", worst["user_limit_factor"])
 
     result.metrics = {
         "scheduler_type": scheduler_type,
-        "queues": queue_rows,
+        "queues": [
+            {k: v for k, v in q.items() if k != "raw_queue"} for q in queue_rows
+        ],
         "worst_queue": worst["queue"],
         "am_saturation": saturation,
         "cluster_available_mb": available_mb,
@@ -334,6 +611,7 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
         "cluster_total_mb": total_mb,
         "cluster_apps_pending": apps_pending,
         "starved_with_free_memory": starved_with_free_memory,
+        "active_users": active_users,
     }
 
     remediation = [
