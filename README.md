@@ -291,13 +291,131 @@ Exit code `1`. Reading it line by line:
 
 | Finding | Fix |
 |---|---|
-| **Check 1 FAIL** — idle kernels holding AMs | Enable culling: `c.MappingKernelManager.cull_idle_timeout = 7200`, `cull_interval = 300`, `cull_connected = True`, `cull_busy = False`; Kill orphaned YARN applications: `yarn application -kill <APP_ID>` |
-| **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` |
-| **Check 3 FAIL** — launch timeouts | Raise the timeout: `c.GatewayProvisionerBase.default_kernel_launch_timeout = 600`. A mitigation, not a cure — resolve Check 2 first |
-| **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers |
+| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Kill orphaned YARN applications via master-local job (see below) or shut down idle kernels via JupyterLab.<br>• **At cluster creation:** Bake in idle culling (`dataproc:jupyter.cull.idle.timeout=7200`, `dataproc:jupyter.cull.connected=true`) and YARN reaper (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). |
+| **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` (required at creation time). |
+| **Check 3 FAIL** — launch timeouts | Raise the timeout: `c.GatewayProvisionerBase.default_kernel_launch_timeout = 600`. A mitigation, not a cure — resolve Check 2 first. |
+| **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers. |
 
 > [!WARNING]
-> `yarn.scheduler.capacity.maximum-am-resource-percent` **cannot be changed on a running cluster.** Either set it at creation time, or edit `/etc/hadoop/conf/capacity-scheduler.xml` on the master and run `yarn rmadmin -refreshQueues`.
+> **Enterprise Multi-Tenant Clusters Enforce Hermetic VM Isolation:**  
+> Multi-tenant Dataproc clusters automatically set `hermetic-vm: 'true'` and `block-project-ssh-keys: 'true'`, which disables the SSH daemon (`Connection refused` on port 22). Furthermore, Dataproc Component Gateway reverse-proxy blocks HTTP `PUT` requests (`405 Method Not Allowed`) to the YARN ResourceManager REST API, and Dataproc jobs run as unprivileged user `admin` without passwordless `sudo`.  
+> **Consequently, configuration files (`/etc/jupyter/` and `/etc/hadoop/conf/`) cannot be modified in-place on running multi-tenant clusters.** Declarative creation-time properties are the only supported mechanism to enforce culling and lifetime reaper policies.
+
+#### How to Kill Orphaned YARN Applications on Running Clusters
+
+When SSH is disabled on hermetic clusters, administrators can safely terminate orphaned YARN applications by submitting a master-local PySpark job. Because `spark.master=local[1]` executes directly inside the master VM driver without requesting a YARN container, it bypasses YARN AM admission limits:
+
+```bash
+gcloud dataproc jobs submit pyspark \
+  --cluster=<CLUSTER_NAME> \
+  --region=<REGION> \
+  --properties="spark.master=local[1]" \
+  -e '
+import subprocess, sys
+app_id = "<APPLICATION_ID>"  # e.g. application_1779383468488_0005
+print(f"Terminating orphaned YARN application: {app_id}")
+res = subprocess.run(["yarn", "application", "-kill", app_id], capture_output=True, text=True)
+print("STDOUT:", res.stdout)
+print("STDERR:", res.stderr)
+sys.exit(res.returncode)
+'
+```
+
+---
+
+## Production Cluster Provisioning Reference
+
+To prevent kernel exhaustion, orphaned YARN drivers, and AM starvation from day one, provision Dataproc multi-tenant clusters with declarative properties baked in.
+
+A ready-to-use provisioning script is included in the repository at [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh):
+
+```bash
+# Make script executable and run:
+chmod +x scripts/create_multitenant_cluster.sh
+./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION]
+```
+
+### Declarative `gcloud` Creation Template (Grouped Properties)
+
+You can copy and paste the entire block below directly into your terminal. The configuration properties are cleanly categorized into subsystem groups and joined with `gcloud`'s custom delimiter syntax (`^|^...`) to prevent embedded commas in jar URLs from breaking argument parsing:
+
+```bash
+# -----------------------------------------------------------------------------
+# 1. Define Cluster Configuration Properties by Subsystem Group
+# -----------------------------------------------------------------------------
+CLUSTER_PROPERTIES=(
+  # === Group 1: YARN Capacity Scheduler & AM Admission Limits ===
+  # Critical: Allows ApplicationMasters to consume up to 80% of total queue memory.
+  # Prevents kernel launch HTTP 500 / TimeoutError when free cluster memory is abundant.
+  "capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8"
+
+  # === Group 2: Spark Driver, Executor & AM Compute Sizing ===
+  # Driver (2g), AM container overhead (640m), 2 Executors (2 cores, 2g each)
+  "spark:spark.driver.memory=2g"
+  "spark:spark.driver.maxResultSize=1920m"
+  "spark:spark.executor.memory=2g"
+  "spark:spark.executor.cores=2"
+  "spark:spark.executor.instances=2"
+  "spark:spark.yarn.am.memory=640m"
+  "spark:spark.scheduler.mode=FAIR"
+  "spark:spark.executorEnv.OPENBLAS_NUM_THREADS=1"
+
+  # === Group 3: Spark SQL Query Optimization ===
+  # Enables cost-based optimizer and runtime bloom filter joins
+  "spark:spark.sql.cbo.enabled=true"
+  "spark:spark.sql.optimizer.runtime.bloomFilter.join.pattern.enabled=true"
+
+  # === Group 4: Apache Iceberg Runtime & BigQuery Metastore Catalog ===
+  # Configures Spark Iceberg 1.6.1 runtime and BigQuery Metastore Catalog integration
+  "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+  "spark:spark.jars=https://storage-download.googleapis.com/maven-central/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,gs://<PROJECT_ID>-tmp/iceberg-bigquery-catalog-1.6.1-1.0.1-beta.jar"
+  "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+  "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
+  "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
+  "spark:spark.sql.catalog.my_catalog.gcp_location=<REGION>"
+  "spark:spark.sql.catalog.my_catalog.gcp_project=<PROJECT_ID>"
+  "spark:spark.sql.catalog.my_catalog.warehouse=gs://<PROJECT_ID>-iceberg-1"
+
+  # === Group 5: Dataproc Multi-Tenancy Engine ===
+  # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
+  "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
+
+  # === Group 6: Jupyter Kernel Gateway Idle Culling ===
+  # Automatically terminate idle kernels after 2 hours (7200s), even with open browser tabs.
+  # Polls every 5 minutes (300s).
+  "dataproc:jupyter.cull.idle.timeout=7200"
+  "dataproc:jupyter.cull.connected=true"
+  "dataproc:jupyter.cull.interval=300"
+
+  # === Group 7: YARN Application Lifetime Reaper (Safety Net) ===
+  # Automatically terminate any YARN application running longer than 24 hours (86400s).
+  # Prevents abandoned interactive sessions from permanently occupying AM slots.
+  "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
+  "yarn:yarn.resourcemanager.app.max-lifetime=86400"
+  "yarn:yarn.resourcemanager.app.default-lifetime=86400"
+)
+
+# -----------------------------------------------------------------------------
+# 2. Execute Cluster Creation (Single Copy-Pasteable Invocation)
+# -----------------------------------------------------------------------------
+gcloud dataproc clusters create <CLUSTER_NAME> \
+  --project=<PROJECT_ID> \
+  --region=<REGION> \
+  --zone=<REGION>-a \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n1-standard-4 \
+  --master-boot-disk-type=pd-standard \
+  --master-boot-disk-size=1000GB \
+  --num-workers=2 \
+  --worker-machine-type=n1-standard-8 \
+  --worker-boot-disk-type=pd-standard \
+  --worker-boot-disk-size=1000GB \
+  --optional-components=JUPYTER_KERNEL_GATEWAY \
+  --enable-component-gateway \
+  --tags=dataproc-internal \
+  --secure-multi-tenancy-user-mapping="admin:admin,<USER_OR_WORKBENCH_SA>:<PROXY_USER>" \
+  --properties="^|^$(IFS='|'; echo "${CLUSTER_PROPERTIES[*]}")"
+```
 
 ---
 
