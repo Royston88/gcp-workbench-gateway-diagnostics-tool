@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.5.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dataproc-gateway-diagnostics"
+version = "0.1.0"
+description = "Read-only CLI diagnostic for Jupyter Kernel Gateway timeouts and YARN ApplicationMaster starvation on Google Cloud Dataproc."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+dependencies = [
+    "google-auth>=2.0.0",
+]
+
+[project.scripts]
+gateway-diag = "dataproc_gateway_diagnostics.cli:main"
+dataproc-gateway-diag = "dataproc_gateway_diagnostics.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dataproc_gateway_diagnostics"]
