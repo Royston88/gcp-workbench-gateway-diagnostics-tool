@@ -118,6 +118,8 @@ def render_text(report: GatewayDiagnosticReport) -> str:
                 lines.append(f"\n   -> {label:<30}: {value}")
             else:
                 lines.append(f"   -> {label:<30}: {value}")
+        if check.details:
+            lines.append("")
         lines.append(f"   -> {'Verdict':<30}: {Status.marker(check.status)}")
         if check.summary:
             for chunk in _wrap(check.summary, WIDTH - 6):
