@@ -267,12 +267,6 @@ def check_kernel_sessions(
         last_str = kernel.get("last_activity", "")
         if last_str and last_str in wb_by_last_activity:
             matched_wb_id = wb_by_last_activity[last_str].get("id")
-        elif last:
-            for lk in local_wb_kernels:
-                lk_last = parse_timestamp(lk.get("last_activity", ""))
-                if lk_last and abs((last - lk_last).total_seconds()) <= 2.0:
-                    matched_wb_id = lk.get("id")
-                    break
 
         kernels_detail.append(
             {
