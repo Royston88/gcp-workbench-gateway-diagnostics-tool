@@ -48,21 +48,20 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 # Environment Configuration (.env Loader)
 # -----------------------------------------------------------------------------
-# Precedence order (lowest to highest):
-# 1. .env.example (committed template defaults)
-# 2. .env (local uncommitted settings)
-# 3. .env.local (local uncommitted overrides, highest file priority)
-# 4. Pre-exported shell environment variables
-# 5. Command line positional arguments ($1, $2, $3, $4)
+# Loads a single configuration file from scripts/ with the following priority:
+# 1. Specified ENV_FILE (if set)
+# 2. scripts/.env.local (developer local overrides, gitignored)
+# 3. scripts/.env (custom environment, gitignored)
+# 4. scripts/.env.example (committed template defaults)
+# Positional arguments ($1, $2, $3, $4) and pre-exported environment variables
+# always take precedence over values defined in the file.
 # -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 load_env_file() {
   local env_file="$1"
   if [[ -f "${env_file}" ]]; then
     echo "Loading configuration from: ${env_file}"
-    # Read variables safely and export them
     set -a
     # shellcheck disable=SC1090
     source "${env_file}"
@@ -72,15 +71,12 @@ load_env_file() {
 
 if [[ -n "${ENV_FILE:-}" ]]; then
   load_env_file "${ENV_FILE}"
-else
-  # Check scripts/ directory first (preferred location)
-  load_env_file "${SCRIPT_DIR}/.env.example"
-  load_env_file "${SCRIPT_DIR}/.env"
+elif [[ -f "${SCRIPT_DIR}/.env.local" ]]; then
   load_env_file "${SCRIPT_DIR}/.env.local"
-  # Also check repository root as fallback
-  load_env_file "${REPO_ROOT}/.env.example"
-  load_env_file "${REPO_ROOT}/.env"
-  load_env_file "${REPO_ROOT}/.env.local"
+elif [[ -f "${SCRIPT_DIR}/.env" ]]; then
+  load_env_file "${SCRIPT_DIR}/.env"
+elif [[ -f "${SCRIPT_DIR}/.env.example" ]]; then
+  load_env_file "${SCRIPT_DIR}/.env.example"
 fi
 
 # -----------------------------------------------------------------------------
