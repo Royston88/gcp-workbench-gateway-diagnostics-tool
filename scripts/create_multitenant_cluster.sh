@@ -18,9 +18,9 @@
 # Script: create_multitenant_cluster.sh
 # Description: Provisions a hardened, enterprise multi-tenant Dataproc cluster
 #              optimized for Vertex AI Workbench with Jupyter Kernel Gateway,
-#              automated idle kernel culling, YARN ApplicationMaster capacity
-#              headroom, YARN application lifetime reaping, and Apache Iceberg
-#              with BigQuery Metastore Catalog integration.
+#              YARN ApplicationMaster capacity headroom, YARN application
+#              lifetime reaping, and Apache Iceberg with BigQuery Metastore
+#              Catalog integration.
 #
 # Usage:
 #   ./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION]
