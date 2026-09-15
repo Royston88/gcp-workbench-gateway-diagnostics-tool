@@ -19,8 +19,8 @@ There are four plausible causes, and they have **conflicting remediations**. Add
 
 | # | Check | Cause it tests |
 |---|---|---|
-| 1 | Zombie / Idle Kernel Sessions | Abandoned kernels holding ApplicationMaster slots |
-| 2 | YARN ApplicationMaster Capacity | AM budget exhausted while memory is free ← **most common** |
+| 1 | Zombie / Idle Kernel Sessions | Abandoned kernels & orphaned YARN applications holding AM slots; audits idle culling & YARN reaper settings |
+| 2 | YARN ApplicationMaster Capacity | AM budget exhausted while memory is free ← **most common**; attributes queue memory to active users |
 | 3 | Kernel Gateway Launch Timeouts | Launch timeout too short for cold starts |
 | 4 | Spark Driver / AM Sizing | Per-kernel footprint too large for expected concurrency |
 
@@ -175,6 +175,7 @@ Exit code `0`. All four causes ruled out — look elsewhere (networking, image, 
    -> AM memory used / limit        : 2.4 GB / 2.5 GB  (96.3%)
    -> Applications ACTIVE           : 1
    -> Applications PENDING (ACCEPTED): 5
+   -> Active queue user(s)          : ds-user-1-svc (1 app(s), AM: 2.4 GB)
    -> Cluster memory                : 8.5 GB used / 24.7 GB total  (16.1 GB free)
    -> Verdict                       : [✗] FAIL
       AM STARVATION CONFIRMED: applications are queued in
@@ -447,6 +448,7 @@ gcloud dataproc clusters create <CLUSTER_NAME> \
 | `--app-age-hours` | `24` | Age threshold for long-running YARN apps |
 | `--lookback-days` | `7` | Cloud Logging lookback window |
 | `--expected-users` | `10` | Expected concurrent users (Check 4) |
+| `--timeout` | `30` | HTTP timeout in seconds for Dataproc / YARN API calls |
 | `--json` | off | Emit JSON instead of text |
 | `--verbose` | off | Log every HTTP request |
 
@@ -477,18 +479,81 @@ gcloud dataproc clusters create <CLUSTER_NAME> \
 !{PY} -m dataproc_gateway_diagnostics diagnose --cluster=<CLUSTER> --json > gateway_audit.json
 ```
 
-The JSON includes the decision inputs, notably:
+The JSON output provides complete, machine-readable telemetry across all checks, including active sessions, orphaned YARN applications, idle culling parameters, YARN application lifetime reaper settings, and queue user attribution:
 
 ```json
 {
-  "am_saturation": 0.963,
-  "cluster_available_mb": 16504,
-  "cluster_apps_pending": 5,
-  "starved_with_free_memory": true
+  "tool_version": "0.1.0",
+  "project_id": "kenly-lakehouse-dev-1",
+  "region_id": "us-central1",
+  "cluster_name": "pyspark-cluster-dev-multitenant",
+  "overall_status": "FAIL",
+  "primary_root_cause": 1,
+  "checks": [
+    {
+      "check_id": 1,
+      "name": "Zombie / Idle Kernel Sessions",
+      "status": "FAIL",
+      "metrics": {
+        "active_kernels": 1,
+        "busy_kernels": 0,
+        "idle_kernels": 1,
+        "running_yarn_apps": 2,
+        "orphaned_yarn_apps": 1,
+        "culling_config": {
+          "cull_idle_timeout": null,
+          "cull_connected": false,
+          "cull_interval": null,
+          "cull_busy": false
+        },
+        "yarn_lifetime_config": {
+          "expiry_time": "UNLIMITED",
+          "is_unlimited": true
+        },
+        "kernels_detail": [
+          {
+            "id": "64fa53be-9cd7-4886-b382-08aac85d4eb2",
+            "name": "pyspark_yarn",
+            "execution_state": "idle",
+            "connections": 4,
+            "associated_app_id": "application_1779383468488_0011"
+          }
+        ],
+        "yarn_apps_detail": [
+          {
+            "id": "application_1779383468488_0005",
+            "name": "67913c09-b89b-4f8b-9d48-e44954a67643",
+            "user": "ds-user-1-svc",
+            "allocated_mb": 4800,
+            "is_orphaned": true
+          }
+        ]
+      }
+    },
+    {
+      "check_id": 2,
+      "name": "YARN ApplicationMaster Capacity",
+      "status": "PASS",
+      "metrics": {
+        "am_saturation": 0.057,
+        "cluster_available_mb": 48020,
+        "cluster_apps_pending": 0,
+        "starved_with_free_memory": false,
+        "active_users": [
+          {
+            "username": "ds-user-1-svc",
+            "active_apps": 1,
+            "pending_apps": 0,
+            "am_used_mb": 4800
+          }
+        ]
+      }
+    }
+  ]
 }
 ```
 
-`starved_with_free_memory: true` is the signature of an admission limit rather than memory exhaustion — the single most useful field for a support engineer.
+`starved_with_free_memory: true` is the signature of an admission limit rather than memory exhaustion — the single most useful field for a support engineer. Additionally, `orphaned_yarn_apps > 0` directly exposes driver leakage detached from active notebook kernels.
 
 ---
 
