@@ -317,15 +317,24 @@ Exit code `1`. Reading it line by line:
 
 | Finding | Fix |
 |---|---|
-| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Kill orphaned YARN applications via master-local job (see below) or shut down idle kernels via JupyterLab.<br>• **At cluster creation:** Bake in idle culling (`dataproc:jupyter.cull.idle.timeout=7200`, `dataproc:jupyter.cull.connected=true`) and YARN reaper (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). |
-| **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` (required at creation time). |
-| **Check 3 FAIL** — launch timeouts | Raise the timeout: `c.GatewayProvisionerBase.default_kernel_launch_timeout = 600`. A mitigation, not a cure — resolve Check 2 first. |
+| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Kill orphaned YARN applications via master-local job (see below) or shut down idle kernels via JupyterLab.<br>• **At cluster creation:** Bake in idle culling (`dataproc:jupyter.cull.idle.timeout=7200`, `dataproc:jupyter.cull.connected=true`) and YARN reaper (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). *(Cannot be modified on running clusters).* |
+| **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` *(Required at creation time; cannot be modified on running clusters).* |
+| **Check 3 FAIL** — launch timeouts | • **On running clusters:** Resolve Check 2 (AM capacity) first; launch timeouts are almost always downstream symptoms of AM queuing rather than slow container starts.<br>• **At cluster creation:** Configure higher launch timeout if custom container environments require longer cold starts. *(Cannot be modified on running clusters).* |
 | **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers. |
 
 > [!WARNING]
-> **Enterprise Multi-Tenant Clusters Enforce Hermetic VM Isolation:**  
-> Multi-tenant Dataproc clusters automatically set `hermetic-vm: 'true'` and `block-project-ssh-keys: 'true'`, which disables the SSH daemon (`Connection refused` on port 22). Furthermore, Dataproc Component Gateway reverse-proxy blocks HTTP `PUT` requests (`405 Method Not Allowed`) to the YARN ResourceManager REST API, and Dataproc jobs run as unprivileged user `admin` without passwordless `sudo`.  
-> **Consequently, configuration files (`/etc/jupyter/` and `/etc/hadoop/conf/`) cannot be modified in-place on running multi-tenant clusters.** Declarative creation-time properties are the only supported mechanism to enforce culling and lifetime reaper policies.
+> **Configuration Parameters CANNOT Be Modified on Running Multi-Tenant Clusters:**  
+> Multi-tenant Dataproc clusters automatically enforce **Hermetic VM Isolation** (`hermetic-vm: 'true'` and `block-project-ssh-keys: 'true'`), which disables the SSH daemon (`Connection refused` on port 22). In addition, Dataproc Component Gateway reverse-proxy blocks HTTP `PUT` requests (`405 Method Not Allowed`) to the YARN ResourceManager REST API, and Dataproc jobs execute as unprivileged user `admin` without passwordless `sudo` privileges.  
+>  
+> **What this means in practice:**  
+> * **Jupyter Gateway Idle Culling** (`dataproc:jupyter.cull.*`) **CANNOT** be enabled or modified on a running cluster.  
+> * **Jupyter Kernel Launch Timeouts** (`default_kernel_launch_timeout`) **CANNOT** be edited on a running cluster.  
+> * **YARN Application Lifetime Reaper** (`yarn:yarn.resourcemanager.app-lifetime-monitor.*`) **CANNOT** be enabled or modified on a running cluster.  
+> * **YARN AM Resource Limits** (`maximum-am-resource-percent`) **CANNOT** be changed on a running cluster.  
+>  
+> **Recommended Actions:**  
+> 1. **Immediate remediation on existing clusters:** Terminate orphaned YARN applications using the master-local PySpark job command below, and shut down idle sessions via the JupyterLab UI.  
+> 2. **Permanent solution:** Recreate or provision new clusters using declarative creation-time properties baked in (see [Production Cluster Provisioning Reference](#production-cluster-provisioning-reference) below).
 
 #### How to Kill Orphaned YARN Applications on Running Clusters
 
