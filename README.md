@@ -3,7 +3,7 @@
 **Tool:** `dataproc-gateway-diagnostics` v0.1.0  
 **Repository:** `https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool`  
 **Audience:** Anyone investigating Jupyter Kernel Gateway `HTTP 500` or `TimeoutError` failures on Dataproc.  
-**Runtime:** One notebook cell. Read-only. No cluster changes.
+**Execution:** CLI / Terminal (Cloud Shell, Cloudtop, Local Workstation, CI/CD) or Vertex AI Workbench (Notebook Cell / Terminal). Read-only. No cluster changes.
 
 ---
 
@@ -99,7 +99,19 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 
 ## Step 2 — Install
 
-Run this **in a notebook cell**:
+The tool can be installed either in an external terminal (Cloud Shell, Cloudtop, local workstation, CI/CD) or directly within a Vertex AI Workbench environment.
+
+### Option A: External Terminal / Cloud Shell / Local Workstation
+
+```bash
+git clone https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool.git
+cd gcp-workbench-gateway-diagnostics-tool
+pip install --no-deps -e .
+```
+
+### Option B: Vertex AI Workbench (Notebook Cell or Terminal)
+
+Run this directly **in a notebook cell**:
 
 ```python
 import sys
@@ -108,13 +120,25 @@ import sys
 ```
 
 > [!IMPORTANT]
-> Use `{sys.executable}`, not a bare `pip`. On Vertex AI Workbench the JupyterLab **server** runs in `/opt/micromamba/envs/jupyterlab` while the notebook **kernel** runs `/opt/micromamba/bin/python3`. A bare `pip install` frequently targets the server environment, and the tool then fails inside cells with `FileNotFoundError: 'gateway-diag'`. `{sys.executable}` always resolves to the interpreter actually executing your cell.
+> When installing inside Workbench notebooks, use `{sys.executable}`, not a bare `pip`. On Vertex AI Workbench the JupyterLab **server** runs in `/opt/micromamba/envs/jupyterlab` while the notebook **kernel** runs `/opt/micromamba/bin/python3`. A bare `pip install` frequently targets the server environment, and the tool then fails inside cells with `FileNotFoundError: 'gateway-diag'`. `{sys.executable}` always resolves to the interpreter actually executing your cell.
 
-`--no-deps` guarantees pip cannot upgrade, downgrade, or overwrite any existing Google Cloud library. The package has a single dependency, `google-auth`, already present on Workbench.
+`--no-deps` guarantees pip cannot upgrade, downgrade, or overwrite any existing Google Cloud library. The package has a single dependency, `google-auth`, already present in modern Google Cloud environments.
 
 ---
 
 ## Step 3 — Run
+
+### Option A: Via Command Line (Terminal / Cloud Shell / Local)
+
+```bash
+# Using the console script directly:
+gateway-diag diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+
+# Or via Python module:
+python3 -m dataproc_gateway_diagnostics diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+```
+
+### Option B: Inside Vertex AI Workbench (Notebook Cell)
 
 ```python
 import sys
@@ -124,7 +148,8 @@ PY = sys.executable
     --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 ```
 
-Run it **while the problem is occurring**. Checks 1 and 2 read live YARN state; on an idle cluster they will legitimately pass even if the cluster fails under load.
+> [!TIP]
+> Run it **while the problem is occurring**. Checks 1 and 2 read live YARN state; on an idle cluster they will legitimately pass even if the cluster fails under load.
 
 ---
 
@@ -422,18 +447,20 @@ gcloud dataproc clusters create <CLUSTER_NAME> \
 
 ## Useful variations
 
-```python
+```bash
+# Terminal (replace with '!{PY} -m dataproc_gateway_diagnostics' if running inside a notebook cell):
+
 # Only the YARN AM capacity check — fast iteration while applying a fix
-!{PY} -m dataproc_gateway_diagnostics diagnose --cluster=<CLUSTER> --checks=2
+gateway-diag diagnose --cluster=<CLUSTER> --checks=2
 
 # Treat kernels idle beyond 30 minutes as zombies
-!{PY} -m dataproc_gateway_diagnostics diagnose --cluster=<CLUSTER> --idle-hours=0.5
+gateway-diag diagnose --cluster=<CLUSTER> --idle-hours=0.5
 
 # Judge the concurrency ceiling against 25 expected users
-!{PY} -m dataproc_gateway_diagnostics diagnose --cluster=<CLUSTER> --expected-users=25
+gateway-diag diagnose --cluster=<CLUSTER> --expected-users=25
 
 # Machine-readable output for a support case
-!{PY} -m dataproc_gateway_diagnostics diagnose --cluster=<CLUSTER> --json > gateway_audit.json
+gateway-diag diagnose --cluster=<CLUSTER> --json > gateway_audit.json
 ```
 
 ### Full option reference
@@ -475,7 +502,11 @@ gcloud dataproc clusters create <CLUSTER_NAME> \
 
 ## Attaching evidence to a support case
 
-```python
+```bash
+# Terminal / Cloud Shell:
+gateway-diag diagnose --cluster=<CLUSTER> --json > gateway_audit.json
+
+# Inside Vertex AI Workbench (notebook cell):
 !{PY} -m dataproc_gateway_diagnostics diagnose --cluster=<CLUSTER> --json > gateway_audit.json
 ```
 
