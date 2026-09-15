@@ -14,7 +14,7 @@
 
 """Read-only diagnostics for Dataproc Jupyter Kernel Gateway kernel launch failures."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .models import (  # noqa: F401
     CheckResult,

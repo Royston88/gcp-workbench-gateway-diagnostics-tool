@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dataproc-gateway-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only CLI diagnostic for Jupyter Kernel Gateway timeouts and YARN ApplicationMaster starvation on Google Cloud Dataproc."
 readme = "README.md"
 license = { text = "Apache-2.0" }
