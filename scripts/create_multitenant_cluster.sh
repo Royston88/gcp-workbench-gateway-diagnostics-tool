@@ -46,27 +46,60 @@
 set -euo pipefail
 
 # -----------------------------------------------------------------------------
+# Environment Configuration (.env Loader)
+# -----------------------------------------------------------------------------
+# Precedence order (lowest to highest):
+# 1. .env.example (committed template defaults)
+# 2. .env (local uncommitted settings)
+# 3. .env.local (local uncommitted overrides, highest file priority)
+# 4. Pre-exported shell environment variables
+# 5. Command line positional arguments ($1, $2, $3, $4)
+# -----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+load_env_file() {
+  local env_file="$1"
+  if [[ -f "${env_file}" ]]; then
+    echo "Loading configuration from: ${env_file}"
+    # Read variables safely and export them
+    set -a
+    # shellcheck disable=SC1090
+    source "${env_file}"
+    set +a
+  fi
+}
+
+if [[ -n "${ENV_FILE:-}" ]]; then
+  load_env_file "${ENV_FILE}"
+else
+  load_env_file "${REPO_ROOT}/.env.example"
+  load_env_file "${REPO_ROOT}/.env"
+  load_env_file "${REPO_ROOT}/.env.local"
+fi
+
+# -----------------------------------------------------------------------------
 # Configuration & Defaults
 # -----------------------------------------------------------------------------
 TIMESTAMP="$(date +%Y%m%d%H%M%S)"
-CLUSTER_NAME="${1:-"pyspark-cluster-multitenant-${TIMESTAMP}"}"
-PROJECT_ID="${2:-$(gcloud config get-value project 2>/dev/null || echo "")}"
+CLUSTER_NAME="${1:-${CLUSTER_NAME:-"pyspark-cluster-multitenant-${TIMESTAMP}"}}"
+PROJECT_ID="${2:-${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
 if [[ -z "${PROJECT_ID}" ]]; then
   echo "ERROR: Google Cloud Project ID is required." >&2
-  echo "Please specify it as argument 2, set it via 'gcloud config set project <PROJECT_ID>', or export PROJECT_ID." >&2
+  echo "Please specify it in .env/.env.local, as argument 2, or via 'gcloud config set project <PROJECT_ID>'." >&2
   echo "Usage: $0 [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]" >&2
   exit 1
 fi
 
-REGION="${3:-$(gcloud config get-value dataproc/region 2>/dev/null || echo "us-central1")}"
+REGION="${3:-${REGION:-$(gcloud config get-value dataproc/region 2>/dev/null || echo "us-central1")}}"
 ZONE="${ZONE:-"${REGION}-a"}"
 
-IMAGE_VERSION="2.3-debian12"
-MASTER_MACHINE_TYPE="n1-standard-4"
-MASTER_BOOT_DISK_SIZE="1000GB"
-NUM_WORKERS=2
-WORKER_MACHINE_TYPE="n1-standard-8"
-WORKER_BOOT_DISK_SIZE="1000GB"
+IMAGE_VERSION="${IMAGE_VERSION:-"2.3-debian12"}"
+MASTER_MACHINE_TYPE="${MASTER_MACHINE_TYPE:-"n1-standard-4"}"
+MASTER_BOOT_DISK_SIZE="${MASTER_BOOT_DISK_SIZE:-"1000GB"}"
+NUM_WORKERS="${NUM_WORKERS:-2}"
+WORKER_MACHINE_TYPE="${WORKER_MACHINE_TYPE:-"n1-standard-8"}"
+WORKER_BOOT_DISK_SIZE="${WORKER_BOOT_DISK_SIZE:-"1000GB"}"
 NETWORK_TAGS="${NETWORK_TAGS:-"dataproc-internal"}"
 
 # -----------------------------------------------------------------------------
@@ -87,11 +120,23 @@ if [[ -z "${USER_MAPPING}" ]]; then
     USER_MAPPING="${CURRENT_USER}:${DEFAULT_SA}"
   else
     echo "ERROR: Multi-tenancy user mapping could not be auto-detected." >&2
-    echo "Please specify USER_MAPPING as argument 4 or set the USER_MAPPING environment variable." >&2
+    echo "Please specify USER_MAPPING in .env/.env.local, as argument 4, or set USER_MAPPING environment variable." >&2
     echo "Example: USER_MAPPING=\"developer@example.com:dataproc-runner@${PROJECT_ID}.iam.gserviceaccount.com\"" >&2
     exit 1
   fi
 fi
+
+# -----------------------------------------------------------------------------
+# Spark & YARN Resource Allocation Tuning
+# -----------------------------------------------------------------------------
+MAX_AM_RESOURCE_PERCENT="${MAX_AM_RESOURCE_PERCENT:-0.8}"
+SPARK_DRIVER_MEMORY="${SPARK_DRIVER_MEMORY:-"2g"}"
+SPARK_DRIVER_MAX_RESULT_SIZE="${SPARK_DRIVER_MAX_RESULT_SIZE:-"1920m"}"
+SPARK_EXECUTOR_MEMORY="${SPARK_EXECUTOR_MEMORY:-"2g"}"
+SPARK_EXECUTOR_CORES="${SPARK_EXECUTOR_CORES:-2}"
+SPARK_EXECUTOR_INSTANCES="${SPARK_EXECUTOR_INSTANCES:-2}"
+SPARK_YARN_AM_MEMORY="${SPARK_YARN_AM_MEMORY:-"640m"}"
+YARN_MAX_APP_LIFETIME="${YARN_MAX_APP_LIFETIME:-86400}"
 
 # -----------------------------------------------------------------------------
 # Optional Apache Iceberg & BigQuery Metastore Catalog Settings
@@ -120,16 +165,16 @@ CLUSTER_PROPERTIES=(
   # === Group 1: YARN Capacity Scheduler & AM Admission Limits ===
   # Critical: Set to 0.8 so ApplicationMasters can utilize up to 80% of queue memory.
   # Prevents kernel launch HTTP 500 / TimeoutError when free memory is abundant.
-  "capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8"
+  "capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=${MAX_AM_RESOURCE_PERCENT}"
 
   # === Group 2: Spark Driver, Executor & AM Compute Sizing ===
-  # Driver (2g), AM container overhead (640m), 2 Executors (2 cores, 2g each)
-  "spark:spark.driver.memory=2g"
-  "spark:spark.driver.maxResultSize=1920m"
-  "spark:spark.executor.memory=2g"
-  "spark:spark.executor.cores=2"
-  "spark:spark.executor.instances=2"
-  "spark:spark.yarn.am.memory=640m"
+  # Driver, AM container overhead, Executors
+  "spark:spark.driver.memory=${SPARK_DRIVER_MEMORY}"
+  "spark:spark.driver.maxResultSize=${SPARK_DRIVER_MAX_RESULT_SIZE}"
+  "spark:spark.executor.memory=${SPARK_EXECUTOR_MEMORY}"
+  "spark:spark.executor.cores=${SPARK_EXECUTOR_CORES}"
+  "spark:spark.executor.instances=${SPARK_EXECUTOR_INSTANCES}"
+  "spark:spark.yarn.am.memory=${SPARK_YARN_AM_MEMORY}"
   "spark:spark.scheduler.mode=FAIR"
   "spark:spark.executorEnv.OPENBLAS_NUM_THREADS=1"
 
@@ -143,11 +188,11 @@ CLUSTER_PROPERTIES=(
   "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
 
   # === Group 5: YARN Application Lifetime Reaper (Safety Net) ===
-  # Automatically terminate any YARN application running longer than 24 hours (86400s).
+  # Automatically terminate any YARN application running longer than max lifetime.
   # Prevents abandoned interactive sessions from permanently occupying AM slots.
   "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
-  "yarn:yarn.resourcemanager.app.max-lifetime=86400"
-  "yarn:yarn.resourcemanager.app.default-lifetime=86400"
+  "yarn:yarn.resourcemanager.app.max-lifetime=${YARN_MAX_APP_LIFETIME}"
+  "yarn:yarn.resourcemanager.app.default-lifetime=${YARN_MAX_APP_LIFETIME}"
 )
 
 # === Optional Group 6: Apache Iceberg Runtime & BigQuery Metastore Catalog ===

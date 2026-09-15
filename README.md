@@ -423,8 +423,15 @@ To prevent kernel exhaustion, orphaned YARN drivers, and AM starvation from day 
 A ready-to-use provisioning script is included in the repository at [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh):
 
 ```bash
-# Make script executable and run:
+# 1. Quick start with environment file:
+# Copy the generic demo template to .env.local (gitignored):
+cp .env.example .env.local
+
+# Edit .env.local with your project details, then run:
 chmod +x scripts/create_multitenant_cluster.sh
+./scripts/create_multitenant_cluster.sh
+
+# Or pass parameters directly via positional arguments:
 ./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]
 ```
 
