@@ -202,33 +202,6 @@ def check_kernel_sessions(
     except (AccessDenied, NotFound, DiagnosticError):
         pass
 
-    # Extract culling parameters
-    cull_idle_timeout: Optional[int] = None
-    cull_connected = False
-    cull_interval: Optional[int] = None
-    cull_busy = False
-
-    for k, v in props.items():
-        k_lower = k.lower()
-        if (
-            "cull_idle_timeout" in k_lower
-            or "cull.idle.timeout" in k_lower
-            or "cull.idle-timeout" in k_lower
-        ):
-            try:
-                cull_idle_timeout = int(v)
-            except (ValueError, TypeError):
-                pass
-        elif "cull_connected" in k_lower or "cull.connected" in k_lower:
-            cull_connected = str(v).strip().lower() in ("true", "1", "yes")
-        elif "cull_interval" in k_lower or "cull.interval" in k_lower:
-            try:
-                cull_interval = int(v)
-            except (ValueError, TypeError):
-                pass
-        elif "cull_busy" in k_lower or "cull.busy" in k_lower:
-            cull_busy = str(v).strip().lower() in ("true", "1", "yes")
-
     # Detect YARN Application Lifetime monitor
     is_yarn_unlimited = True
     yarn_lifetime_val = "UNLIMITED (no automatic reaper)"
@@ -237,7 +210,11 @@ def check_kernel_sessions(
     ) or props.get("yarn:yarn.resourcemanager.app.default-lifetime")
     if yarn_prop_lifetime and yarn_prop_lifetime != "-1":
         is_yarn_unlimited = False
-        yarn_lifetime_val = f"{yarn_prop_lifetime}s"
+        try:
+            secs = int(yarn_prop_lifetime)
+            yarn_lifetime_val = f"{secs}s ({humanize_duration(secs)} max lifetime)"
+        except (ValueError, TypeError):
+            yarn_lifetime_val = f"{yarn_prop_lifetime}s"
     else:
         for app in running_apps:
             timeouts = app.get("timeouts", {}).get("timeout", [])
@@ -247,6 +224,18 @@ def check_kernel_sessions(
                     if exp and exp != "UNLIMITED":
                         is_yarn_unlimited = False
                         yarn_lifetime_val = str(exp)
+
+    # Probe local Workbench JupyterLab instance if running in situ on Workbench VM
+    local_wb_kernels = (
+        client.local_workbench_kernels()
+        if hasattr(client, "local_workbench_kernels")
+        else []
+    )
+    wb_by_last_activity = {
+        lk.get("last_activity"): lk
+        for lk in local_wb_kernels
+        if lk.get("last_activity")
+    }
 
     # Build active kernel IDs and kernels_detail
     active_kernel_ids = {k.get("id", "") for k in kernels if k.get("id")}
@@ -273,6 +262,18 @@ def check_kernel_sessions(
                 assoc_app_id = app.get("id")
                 break
 
+        # Check if local Workbench JupyterLab kernel matches
+        matched_wb_id: Optional[str] = None
+        last_str = kernel.get("last_activity", "")
+        if last_str and last_str in wb_by_last_activity:
+            matched_wb_id = wb_by_last_activity[last_str].get("id")
+        elif last:
+            for lk in local_wb_kernels:
+                lk_last = parse_timestamp(lk.get("last_activity", ""))
+                if lk_last and abs((last - lk_last).total_seconds()) <= 2.0:
+                    matched_wb_id = lk.get("id")
+                    break
+
         kernels_detail.append(
             {
                 "id": k_id,
@@ -282,6 +283,7 @@ def check_kernel_sessions(
                 "idle_seconds": idle_seconds,
                 "connections": int(kernel.get("connections", 0) or 0),
                 "associated_yarn_app": assoc_app_id,
+                "workbench_kernel_id": matched_wb_id,
             }
         )
 
@@ -365,19 +367,6 @@ def check_kernel_sessions(
 
     # Configuration Status
     result.add("--- Configuration Status ---", "")
-    result.add(
-        "Gateway cull_idle_timeout",
-        f"{cull_idle_timeout}s" if cull_idle_timeout else "Not configured (disabled)",
-    )
-    result.add(
-        "Gateway cull_connected",
-        f"{cull_connected}"
-        + (
-            " (open browser tabs block culling)"
-            if not cull_connected
-            else " (active)"
-        ),
-    )
     result.add("YARN Application Lifetime", yarn_lifetime_val)
 
     # Active Kernel Gateway Sessions
@@ -386,6 +375,10 @@ def check_kernel_sessions(
         for kd in kernels_detail:
             k_id_short = kd["id"][:8] if len(kd["id"]) > 8 else kd["id"]
             result.add(f"[Kernel] {k_id_short}...", kd["name"])
+            if kd.get("workbench_kernel_id"):
+                wb_full = kd["workbench_kernel_id"]
+                wb_short = wb_full[:8]
+                result.add("      * Workbench UI ID", f"{wb_short} ({wb_full})")
             result.add(
                 "      * State",
                 f"{kd['execution_state']} (idle for {humanize_duration(kd['idle_seconds'])})",
@@ -428,12 +421,6 @@ def check_kernel_sessions(
         "long_running_apps": len(long_running),
         "orphaned_yarn_apps": orphaned_count,
         "app_age_threshold_hours": app_age_hours,
-        "culling_config": {
-            "cull_idle_timeout": cull_idle_timeout,
-            "cull_connected": cull_connected,
-            "cull_interval": cull_interval,
-            "cull_busy": cull_busy,
-        },
         "yarn_lifetime_config": {
             "expiry_time": yarn_lifetime_val,
             "is_unlimited": is_yarn_unlimited,
@@ -442,17 +429,20 @@ def check_kernel_sessions(
         "yarn_apps_detail": yarn_apps_detail,
     }
 
-    remediation = [
-        "Enable idle kernel culling on the Kernel Gateway "
-        "(cull_idle_timeout=7200, cull_interval=300, cull_connected=True).",
-    ]
+    remediation = []
+    if is_yarn_unlimited:
+        remediation.append(
+            "Configure YARN Application Lifetime Reaper "
+            "(yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true, "
+            "yarn:yarn.resourcemanager.app.max-lifetime=86400) to automatically terminate abandoned sessions."
+        )
     if orphaned_count > 0:
         remediation.append(
             f"Kill {orphaned_count} orphaned YARN application(s): "
             "yarn application -kill <APP_ID> or via YARN ResourceManager Web UI."
         )
     remediation.append(
-        "Shut down abandoned kernels: JupyterLab > Running Terminals and Kernels."
+        "Shut down abandoned kernels via JupyterLab: 'Running Terminals and Kernels' tab in the left sidebar, or Kernel > Shut Down All Kernels."
     )
 
     if idle_kernels or long_running or orphaned_count > 0:

@@ -367,6 +367,20 @@ class GatewayDiagnosticClient:
         data = self._get_json(f"{base}/api/kernels")
         return data if isinstance(data, list) else []
 
+    def local_workbench_kernels(
+        self, url: str = "http://127.0.0.1:8080/api/kernels", timeout: float = 2.0
+    ) -> List[Dict[str, Any]]:
+        """Probes local JupyterLab server on 127.0.0.1:8080 if running inside a Workbench VM."""
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+        return []
+
     # ------------------------------------------------------------------
     # Cloud Logging
     # ------------------------------------------------------------------

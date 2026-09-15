@@ -19,7 +19,7 @@ There are four plausible causes, and they have **conflicting remediations**. Add
 
 | # | Check | Cause it tests |
 |---|---|---|
-| 1 | Zombie / Idle Kernel Sessions | Abandoned kernels & orphaned YARN applications holding AM slots; audits idle culling & YARN reaper settings |
+| 1 | Zombie / Idle Kernel Sessions | Abandoned kernels & orphaned YARN applications holding AM slots; audits YARN application lifetime reaper settings & session activity |
 | 2 | YARN ApplicationMaster Capacity | AM budget exhausted while memory is free ← **most common**; attributes queue memory to active users |
 | 3 | Kernel Gateway Launch Timeouts | Launch timeout too short for cold starts |
 | 4 | Spark Driver / AM Sizing | Per-kernel footprint too large for expected concurrency |
@@ -243,8 +243,6 @@ Exit code `1`. Reading it line by line:
    -> Running YARN applications     : 2 (older than 24h: 2)
 
    --- Configuration Status ---
-   -> Gateway cull_idle_timeout     : Not configured (disabled)
-   -> Gateway cull_connected        : False (open browser tabs block culling)
    -> YARN Application Lifetime     : UNLIMITED (no automatic reaper)
 
    --- Active Kernel Gateway Sessions ---
@@ -282,13 +280,14 @@ Exit code `1`. Reading it line by line:
 =================================================================
              RECOMMENDED REMEDIATION (priority order)
 =================================================================
-   1. Enable idle kernel culling on the Kernel Gateway
-      (cull_idle_timeout=7200, cull_interval=300,
-      cull_connected=True).
+   1. Configure YARN Application Lifetime Reaper
+      (yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true,
+      yarn:yarn.resourcemanager.app.max-lifetime=86400) to
+      automatically terminate abandoned sessions.
    2. Kill 1 orphaned YARN application(s): yarn application
       -kill <APP_ID> or via YARN ResourceManager Web UI.
-   3. Shut down abandoned kernels: JupyterLab > Running
-      Terminals and Kernels.
+   3. Shut down abandoned kernels via JupyterLab: 'Running
+      Terminals and Kernels' tab, or Kernel > Shut Down All Kernels.
 =================================================================
 ```
 
@@ -296,8 +295,7 @@ Exit code `1`. Reading it line by line:
 
 | Line | Why it matters |
 |---|---|
-| `Gateway cull_connected : False` | Open browser tabs block culling even if `cull_idle_timeout` is configured. |
-| `YARN Application Lifetime : UNLIMITED` | YARN has no lifetime monitor active to reap long-abandoned interactive drivers. |
+| `YARN Application Lifetime : UNLIMITED` | YARN has no lifetime monitor active to reap long-abandoned interactive drivers. (When configured: shows duration e.g. `86400s (1d 0h 0m max lifetime)`). |
 | `[Active Gateway Session]` | PySpark session initiated from Workbench, currently idle with WebSocket connections holding the AM slot. |
 | `[ORPHANED YARN APP]` | A Spark driver running on YARN with **no active kernel** on the gateway. Left behind after a gateway crash or ungraceful shutdown. |
 | `Kill orphaned YARN application` | Orphaned apps cannot be culled through Jupyter; they must be terminated via `yarn application -kill <APP_ID>`. |
@@ -597,12 +595,6 @@ The JSON output provides complete, machine-readable telemetry across all checks,
         "idle_kernels": 1,
         "running_yarn_apps": 2,
         "orphaned_yarn_apps": 1,
-        "culling_config": {
-          "cull_idle_timeout": null,
-          "cull_connected": false,
-          "cull_interval": null,
-          "cull_busy": false
-        },
         "yarn_lifetime_config": {
           "expiry_time": "UNLIMITED",
           "is_unlimited": true
