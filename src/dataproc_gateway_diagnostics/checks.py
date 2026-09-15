@@ -225,17 +225,20 @@ def check_kernel_sessions(
                         is_yarn_unlimited = False
                         yarn_lifetime_val = str(exp)
 
-    # Probe local Workbench JupyterLab instance if running in situ on Workbench VM
-    local_wb_kernels = (
-        client.local_workbench_kernels()
-        if hasattr(client, "local_workbench_kernels")
-        else []
+    # 1. In Situ Probe: Probe local Workbench JupyterLab instance if running on Workbench VM
+    in_situ_wb: Dict[str, Any] = (
+        client.local_workbench_sessions()
+        if hasattr(client, "local_workbench_sessions")
+        else {"is_workbench": False}
     )
-    wb_by_last_activity = {
-        lk.get("last_activity"): lk
-        for lk in local_wb_kernels
-        if lk.get("last_activity")
-    }
+
+    # 2. External Probe: If not running inside Workbench, query Workbench instance inventory
+    wb_inventory: Dict[str, Dict[str, Any]] = {}
+    if not in_situ_wb.get("is_workbench") and hasattr(client, "workbench_instances"):
+        wb_inventory = client.workbench_instances()
+
+    # Cache for looked-up notebook files to avoid duplicate Cloud Logging queries
+    looked_up_notebooks: Dict[str, Optional[str]] = {}
 
     # Build active kernel IDs and kernels_detail
     active_kernel_ids = {k.get("id", "") for k in kernels if k.get("id")}
@@ -254,19 +257,54 @@ def check_kernel_sessions(
 
         # Check if any running YARN app corresponds to this kernel
         assoc_app_id: Optional[str] = None
+        assoc_app: Optional[Dict[str, Any]] = None
         for app in running_apps:
             app_name = app.get("name", "")
             if k_id in app_name or (
                 UUID_REGEX.match(app_name) and app_name.lower() == k_id.lower()
             ):
                 assoc_app_id = app.get("id")
+                assoc_app = app
                 break
 
-        # Check if local Workbench JupyterLab kernel matches
+        # Workbench and Notebook correlation
+        wb_vm: Optional[str] = None
+        wb_state: Optional[str] = None
+        wb_owner: Optional[str] = None
+        wb_notebook: Optional[str] = None
         matched_wb_id: Optional[str] = None
+
         last_str = kernel.get("last_activity", "")
-        if last_str and last_str in wb_by_last_activity:
-            matched_wb_id = wb_by_last_activity[last_str].get("id")
+
+        # Mode A: Running In Situ inside Workbench VM
+        if in_situ_wb.get("is_workbench"):
+            wb_vm = in_situ_wb.get("vm_name")
+            wb_owner = in_situ_wb.get("owner")
+            sess_info = (
+                in_situ_wb.get("sessions_by_kernel_id", {}).get(k_id)
+                or in_situ_wb.get("sessions_by_last_activity", {}).get(last_str)
+            )
+            if sess_info:
+                matched_wb_id = sess_info.get("session_id")
+                wb_notebook = sess_info.get("notebook_path") or sess_info.get("notebook_name")
+
+        # Mode B: Running outside Workbench (Admin CLI / Cloudtop)
+        elif assoc_app and wb_inventory:
+            yarn_user = assoc_app.get("user", "")
+            wb_inst = wb_inventory.get(yarn_user) or wb_inventory.get(yarn_user.lower())
+            if wb_inst:
+                wb_vm = wb_inst.get("name")
+                wb_state = wb_inst.get("state")
+                wb_owner = wb_inst.get("creator")
+                inst_id = wb_inst.get("instance_id")
+                if inst_id:
+                    if inst_id not in looked_up_notebooks:
+                        looked_up_notebooks[inst_id] = (
+                            client.lookup_workbench_notebook_file(inst_id, wb_vm)
+                            if hasattr(client, "lookup_workbench_notebook_file")
+                            else None
+                        )
+                    wb_notebook = looked_up_notebooks[inst_id]
 
         kernels_detail.append(
             {
@@ -277,6 +315,10 @@ def check_kernel_sessions(
                 "idle_seconds": idle_seconds,
                 "connections": int(kernel.get("connections", 0) or 0),
                 "associated_yarn_app": assoc_app_id,
+                "workbench_vm": wb_vm,
+                "workbench_state": wb_state,
+                "workbench_owner": wb_owner,
+                "workbench_notebook": wb_notebook,
                 "workbench_kernel_id": matched_wb_id,
             }
         )
@@ -369,6 +411,13 @@ def check_kernel_sessions(
         for kd in kernels_detail:
             k_id_short = kd["id"][:8] if len(kd["id"]) > 8 else kd["id"]
             result.add(f"[Kernel] {k_id_short}...", kd["name"])
+            if kd.get("workbench_vm"):
+                state_str = f" ({kd['workbench_state']})" if kd.get("workbench_state") else ""
+                result.add("      * Workbench VM", f"{kd['workbench_vm']}{state_str}")
+            if kd.get("workbench_owner"):
+                result.add("      * Workbench Owner", kd["workbench_owner"])
+            if kd.get("workbench_notebook"):
+                result.add("      * Notebook File", kd["workbench_notebook"])
             if kd.get("workbench_kernel_id"):
                 wb_full = kd["workbench_kernel_id"]
                 wb_short = wb_full[:8]

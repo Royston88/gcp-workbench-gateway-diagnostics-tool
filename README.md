@@ -79,8 +79,8 @@ In security-conscious enterprise environments, granting `roles/dataproc.editor` 
 gcloud iam roles create DataprocGatewayDiagnosticsAuditor \
     --project=<PROJECT_ID> \
     --title="Dataproc Gateway Diagnostics Auditor" \
-    --description="Read-only permissions for diagnosing Jupyter Kernel Gateway and YARN via Component Gateway" \
-    --permissions="dataproc.clusters.get,dataproc.clusters.use,logging.entries.list" \
+    --description="Read-only permissions for diagnosing Jupyter Kernel Gateway, YARN, and Workbench correlation" \
+    --permissions="dataproc.clusters.get,dataproc.clusters.use,logging.entries.list,notebooks.instances.list" \
     --stage="GA"
 ```
 
@@ -248,6 +248,10 @@ Exit code `1`. Reading it line by line:
    --- Active Kernel Gateway Sessions ---
 
    -> [Kernel] 64fa53be...          : pyspark_yarn
+      * Workbench VM                : instance-20260901-162000-single-svc (ACTIVE)
+      * Workbench Owner             : ds_user_1@kenly.altostrat.com
+      * Notebook File               : churn_analysis.ipynb
+      * Workbench UI ID             : 64fa53be (64fa53be-9cd7-4886-b382-08aac85d4eb2)
       * State                       : idle (idle for 12d 11h 59m)
       * Active Connections          : 4 connected WebSocket client(s)
       * Associated YARN App         : application_1779383468488_0011
@@ -278,7 +282,7 @@ Exit code `1`. Reading it line by line:
    Check 2  YARN ApplicationMaster Capacity  : [✓] PASS
    OVERALL                                   : [✗] FAIL
 =================================================================
-             RECOMMENDED REMEDIATION (priority order)
+              RECOMMENDED REMEDIATION (priority order)
 =================================================================
    1. Configure YARN Application Lifetime Reaper
       (yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true,
@@ -295,6 +299,10 @@ Exit code `1`. Reading it line by line:
 
 | Line | Why it matters |
 |---|---|
+| `* Workbench VM` | Identifies the Vertex AI Workbench Compute Engine instance that initiated the session (resolved via local metadata or external control plane API). |
+| `* Workbench Owner` | Identifies the human creator / owner of the notebook instance (`creator` or `proxy-user-mail`). |
+| `* Notebook File` | Discovered active `.ipynb` notebook file path (via in-situ JupyterLab `/api/sessions` or external Cloud Logging serial console referer trace). |
+| `* Workbench UI ID` | The local session UUID shown in JupyterLab's *Running Terminals and Kernels* left sidebar (populated when executing inside the Workbench VM). |
 | `YARN Application Lifetime : UNLIMITED` | YARN has no lifetime monitor active to reap long-abandoned interactive drivers. (When configured: shows duration e.g. `86400s (1d 0h 0m max lifetime)`). |
 | `[Active Gateway Session]` | PySpark session initiated from Workbench, currently idle with WebSocket connections holding the AM slot. |
 | `[ORPHANED YARN APP]` | A Spark driver running on YARN with **no active kernel** on the gateway. Left behind after a gateway crash or ungraceful shutdown. |

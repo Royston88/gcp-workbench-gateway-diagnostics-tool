@@ -26,6 +26,7 @@ Design constraints
 import json
 import logging
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.parse
@@ -367,6 +368,89 @@ class GatewayDiagnosticClient:
         data = self._get_json(f"{base}/api/kernels")
         return data if isinstance(data, list) else []
 
+    def local_workbench_sessions(self, timeout: float = 2.0) -> Dict[str, Any]:
+        """Probes local JupyterLab and GCE metadata if running inside a Workbench VM."""
+        result: Dict[str, Any] = {
+            "is_workbench": False,
+            "vm_name": None,
+            "owner": None,
+            "sessions_by_kernel_id": {},
+            "sessions_by_last_activity": {},
+            "raw_kernels": [],
+        }
+
+        # 1. Probe local JupyterLab /api/sessions and /api/kernels FIRST.
+        # Only if JupyterLab responds on 127.0.0.1:8080 do we consider this an in-situ environment.
+        has_local_jupyter = False
+
+        try:
+            req_sess = urllib.request.Request(
+                "http://127.0.0.1:8080/api/sessions",
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req_sess, timeout=timeout) as resp:
+                sessions_data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(sessions_data, list):
+                    has_local_jupyter = True
+                    for sess in sessions_data:
+                        k = sess.get("kernel") or {}
+                        k_id = k.get("id")
+                        last_act = k.get("last_activity")
+                        info = {
+                            "session_id": sess.get("id"),
+                            "notebook_path": sess.get("path") or sess.get("name"),
+                            "notebook_name": sess.get("name"),
+                            "kernel_id": k_id,
+                            "last_activity": last_act,
+                        }
+                        if k_id:
+                            result["sessions_by_kernel_id"][k_id] = info
+                        if last_act:
+                            result["sessions_by_last_activity"][last_act] = info
+        except Exception:
+            pass
+
+        try:
+            req_k = urllib.request.Request(
+                "http://127.0.0.1:8080/api/kernels",
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req_k, timeout=timeout) as resp:
+                kernels_data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(kernels_data, list):
+                    has_local_jupyter = True
+                    result["raw_kernels"] = kernels_data
+        except Exception:
+            pass
+
+        if not has_local_jupyter:
+            return result
+
+        result["is_workbench"] = True
+
+        # 2. If running alongside JupyterLab, read VM identity from GCE metadata
+        try:
+            req_name = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1/instance/name",
+                headers={"Metadata-Flavor": "Google"},
+            )
+            with urllib.request.urlopen(req_name, timeout=1.0) as resp:
+                result["vm_name"] = resp.read().decode("utf-8").strip()
+        except Exception:
+            pass
+
+        try:
+            req_user = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1/instance/attributes/proxy-user-mail",
+                headers={"Metadata-Flavor": "Google"},
+            )
+            with urllib.request.urlopen(req_user, timeout=1.0) as resp:
+                result["owner"] = resp.read().decode("utf-8").strip()
+        except Exception:
+            pass
+
+        return result
+
     def local_workbench_kernels(
         self, url: str = "http://127.0.0.1:8080/api/kernels", timeout: float = 2.0
     ) -> List[Dict[str, Any]]:
@@ -380,6 +464,105 @@ class GatewayDiagnosticClient:
         except Exception:
             pass
         return []
+
+    def workbench_instances(self) -> Dict[str, Dict[str, Any]]:
+        """Queries Vertex AI Workbench v2 API for instance inventory in the project.
+
+        Returns a dictionary indexed by Service Account email and SA username prefix:
+          sa_key -> {"name": instance_name, "creator": creator, "instance_id": id, "state": state}
+        """
+        url = f"https://notebooks.googleapis.com/v2/projects/{self.project_id}/locations/-/instances"
+        try:
+            data = self._get_json(url)
+        except (AccessDenied, NotFound, DiagnosticError) as exc:
+            logger.debug(
+                "Workbench API query unavailable (%s); skipping external instance mapping.",
+                exc,
+            )
+            return {}
+
+        instances = data.get("instances", []) if isinstance(data, dict) else []
+        inventory: Dict[str, Dict[str, Any]] = {}
+
+        for inst in instances:
+            full_name = inst.get("name", "")
+            vm_name = full_name.split("/")[-1] if full_name else "unknown"
+            creator = inst.get("creator", "")
+            state = inst.get("state", "ACTIVE")
+            proxy_uri = inst.get("proxyUri", "")
+
+            # Extract numeric GCE instance id if available
+            gce_setup = inst.get("gceSetup", {})
+            instance_id = gce_setup.get("instanceId", "")
+            sa_list = gce_setup.get("serviceAccounts", [])
+            for sa in sa_list:
+                email = sa.get("email", "").strip()
+                if not email:
+                    continue
+                info = {
+                    "name": vm_name,
+                    "creator": creator,
+                    "state": state,
+                    "proxy_uri": proxy_uri,
+                    "instance_id": str(instance_id),
+                    "sa_email": email,
+                }
+                # Index by full SA email
+                inventory[email] = info
+                inventory[email.lower()] = info
+                # Index by SA prefix before @ (e.g. ds-user-1-svc)
+                prefix = email.split("@")[0]
+                inventory[prefix] = info
+                inventory[prefix.lower()] = info
+
+            # Also index by creator email & prefix if creator is present
+            if creator:
+                creator_clean = creator.strip()
+                c_info = {
+                    "name": vm_name,
+                    "creator": creator,
+                    "state": state,
+                    "proxy_uri": proxy_uri,
+                    "instance_id": str(instance_id),
+                    "sa_email": sa_list[0].get("email", "") if sa_list else "",
+                }
+                inventory[creator_clean] = c_info
+                inventory[creator_clean.lower()] = c_info
+                c_prefix = creator_clean.split("@")[0]
+                inventory[c_prefix] = c_info
+                inventory[c_prefix.lower()] = c_info
+
+        return inventory
+
+    def lookup_workbench_notebook_file(
+        self, instance_id: str, instance_name: Optional[str] = None
+    ) -> Optional[str]:
+        """Best-effort discovery of the active notebook file from Cloud Logging serial console entries."""
+        if not instance_id and not instance_name:
+            return None
+
+        filter_parts = ['resource.type="gce_instance"']
+        if instance_id:
+            filter_parts.append(f'resource.labels.instance_id="{instance_id}"')
+        filter_parts.append('textPayload:"/lab/tree/"')
+
+        log_filter = "\n".join(filter_parts)
+        try:
+            entries = self.log_entries(log_filter, page_size=20)
+        except Exception as exc:
+            logger.debug("Cloud Logging serial trace unavailable (%s)", exc)
+            return None
+
+        for entry in entries:
+            text = entry.get("textPayload") or ""
+            match = re.search(r"/lab/tree/([^ \r\n\t?&\\\"']+)", text)
+            if match:
+                raw_path = match.group(1).strip().rstrip("\r\n\\\"'")
+                notebook_file = urllib.parse.unquote(raw_path)
+                if notebook_file:
+                    return notebook_file
+
+        return None
 
     # ------------------------------------------------------------------
     # Cloud Logging
