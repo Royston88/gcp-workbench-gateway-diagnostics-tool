@@ -53,9 +53,8 @@ NETWORK_TAGS="dataproc-internal"
 # Multi-tenancy user mapping: maps Dataproc system users to proxy identities
 USER_MAPPING="${USER_MAPPING:-"admin:admin,ds-user-1-svc:ds-user-1-svc"}"
 
-# GCS storage paths for Iceberg catalog & jars
 ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-"gs://${PROJECT_ID}-iceberg-1"}"
-ICEBERG_TMP_BUCKET="${ICEBERG_TMP_BUCKET:-"gs://${PROJECT_ID}-tmp"}"
+ICEBERG_TMP_BUCKET="${ICEBERG_TMP_BUCKET:-"https://storage.googleapis.com/${PROJECT_ID}-tmp"}"
 
 echo "============================================================================="
 echo "Dataproc Multi-Tenant Cluster Provisioning"
