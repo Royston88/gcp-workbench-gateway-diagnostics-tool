@@ -51,6 +51,7 @@ WORKER_BOOT_DISK_SIZE="1000GB"
 NETWORK_TAGS="dataproc-internal"
 
 # Multi-tenancy user mapping: maps Dataproc system users and human identities to proxy service accounts
+# Note: Dataproc extracts username prefixes (before @). Every entry MUST have a unique prefix.
 DEFAULT_USER_MAPPING="admin@kenly.altostrat.com:admin-svc@${PROJECT_ID}.iam.gserviceaccount.com"
 DEFAULT_USER_MAPPING="${DEFAULT_USER_MAPPING},ds_user_1@kenly.altostrat.com:ds-user-1-svc@${PROJECT_ID}.iam.gserviceaccount.com"
 DEFAULT_USER_MAPPING="${DEFAULT_USER_MAPPING},ds-user-1-svc@${PROJECT_ID}.iam.gserviceaccount.com:ds-user-1-svc@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -60,13 +61,6 @@ USER_MAPPING="${USER_MAPPING:-"${DEFAULT_USER_MAPPING}"}"
 
 ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-"gs://${PROJECT_ID}-iceberg-1"}"
 ICEBERG_TMP_BUCKET="${ICEBERG_TMP_BUCKET:-"https://storage.googleapis.com/${PROJECT_ID}-tmp"}"
-
-# Culling configuration (audited by gateway-diag)
-CULL_IDLE_TIMEOUT="${CULL_IDLE_TIMEOUT:-"7200"}"
-CULL_CONNECTED="${CULL_CONNECTED:-"true"}"
-CULL_INTERVAL="${CULL_INTERVAL:-"300"}"
-# Note: Dataproc rejects --initialization-actions on secure multi-tenant clusters
-INIT_ACTIONS="${INIT_ACTIONS:-""}"
 
 echo "============================================================================="
 echo "Dataproc Multi-Tenant Cluster Provisioning"
@@ -78,8 +72,6 @@ echo "Image Version: ${IMAGE_VERSION}"
 echo "Master Node:   1x ${MASTER_MACHINE_TYPE} (${MASTER_BOOT_DISK_SIZE})"
 echo "Worker Nodes:  ${NUM_WORKERS}x ${WORKER_MACHINE_TYPE} (${WORKER_BOOT_DISK_SIZE})"
 echo "User Mapping:  ${USER_MAPPING}"
-echo "Culling Conf:  timeout=${CULL_IDLE_TIMEOUT}s, interval=${CULL_INTERVAL}s, connected=${CULL_CONNECTED}"
-echo "Init Actions:  ${INIT_ACTIONS:-"None"}"
 echo "============================================================================="
 
 # -----------------------------------------------------------------------------
@@ -122,14 +114,7 @@ CLUSTER_PROPERTIES=(
   # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
   "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
 
-  # === Group 6: Jupyter Kernel Gateway Idle Culling ===
-  # Automatically terminate idle kernels after timeout (${CULL_IDLE_TIMEOUT}s), even with open browser tabs.
-  # Polls every ${CULL_INTERVAL}s.
-  "dataproc:jupyter.cull.idle.timeout=${CULL_IDLE_TIMEOUT}"
-  "dataproc:jupyter.cull.connected=${CULL_CONNECTED}"
-  "dataproc:jupyter.cull.interval=${CULL_INTERVAL}"
-
-  # === Group 7: YARN Application Lifetime Reaper (Safety Net) ===
+  # === Group 6: YARN Application Lifetime Reaper (Safety Net) ===
   # Automatically terminate any YARN application running longer than 24 hours (86400s).
   # Prevents abandoned interactive sessions from permanently occupying AM slots.
   "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
@@ -147,12 +132,6 @@ PROPERTIES_ARG="^|^$(IFS='|'; echo "${CLUSTER_PROPERTIES[*]}")"
 # -----------------------------------------------------------------------------
 # Execute Cluster Creation Command
 # -----------------------------------------------------------------------------
-# Build extra flags
-EXTRA_FLAGS=()
-if [[ -n "${INIT_ACTIONS}" ]]; then
-  EXTRA_FLAGS+=("--initialization-actions=${INIT_ACTIONS}")
-fi
-
 echo "Provisioning cluster '${CLUSTER_NAME}' in project '${PROJECT_ID}'..."
 gcloud dataproc clusters create "${CLUSTER_NAME}" \
   --project="${PROJECT_ID}" \
@@ -170,8 +149,7 @@ gcloud dataproc clusters create "${CLUSTER_NAME}" \
   --enable-component-gateway \
   --tags="${NETWORK_TAGS}" \
   --secure-multi-tenancy-user-mapping="${USER_MAPPING}" \
-  --properties="${PROPERTIES_ARG}" \
-  "${EXTRA_FLAGS[@]}"
+  --properties="${PROPERTIES_ARG}"
 
 echo "============================================================================="
 echo "Cluster '${CLUSTER_NAME}' provisioned successfully!"

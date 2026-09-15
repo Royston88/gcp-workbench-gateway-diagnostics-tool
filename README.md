@@ -317,7 +317,7 @@ Exit code `1`. Reading it line by line:
 
 | Finding | Fix |
 |---|---|
-| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Kill orphaned YARN applications via master-local job (see below) or shut down idle kernels via JupyterLab.<br>• **At cluster creation:** Bake in idle culling (`dataproc:jupyter.cull.idle.timeout=7200`, `dataproc:jupyter.cull.connected=true`) and YARN reaper (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). *(Cannot be modified on running clusters).* |
+| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Shut down idle kernels via JupyterLab (*Running Terminals and Kernels*) or kill orphaned YARN applications via master-local job (see below).<br>• **At cluster creation:** Enforce YARN application lifetime reaping (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). *(Note: Dataproc multi-tenant clusters do not enforce OS daemon culling via cluster properties or init actions; see architectural note below).* |
 | **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` *(Required at creation time; cannot be modified on running clusters).* |
 | **Check 3 FAIL** — launch timeouts | • **On running clusters:** Resolve Check 2 (AM capacity) first; launch timeouts are almost always downstream symptoms of AM queuing rather than slow container starts.<br>• **At cluster creation:** Configure higher launch timeout if custom container environments require longer cold starts. *(Cannot be modified on running clusters).* |
 | **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers. |
@@ -327,7 +327,6 @@ Exit code `1`. Reading it line by line:
 > Multi-tenant Dataproc clusters automatically enforce **Hermetic VM Isolation** (`hermetic-vm: 'true'` and `block-project-ssh-keys: 'true'`), which disables the SSH daemon (`Connection refused` on port 22). In addition, Dataproc Component Gateway reverse-proxy blocks HTTP `PUT` requests (`405 Method Not Allowed`) to the YARN ResourceManager REST API, and Dataproc jobs execute as unprivileged user `admin` without passwordless `sudo` privileges.  
 >  
 > **What this means in practice:**  
-> * **Jupyter Gateway Idle Culling** (`dataproc:jupyter.cull.*`) **CANNOT** be enabled or modified on a running cluster.  
 > * **Jupyter Kernel Launch Timeouts** (`default_kernel_launch_timeout`) **CANNOT** be edited on a running cluster.  
 > * **YARN Application Lifetime Reaper** (`yarn:yarn.resourcemanager.app-lifetime-monitor.*`) **CANNOT** be enabled or modified on a running cluster.  
 > * **YARN AM Resource Limits** (`maximum-am-resource-percent`) **CANNOT** be changed on a running cluster.  
@@ -335,6 +334,16 @@ Exit code `1`. Reading it line by line:
 > **Recommended Actions:**  
 > 1. **Immediate remediation on existing clusters:** Terminate orphaned YARN applications using the master-local PySpark job command below, and shut down idle sessions via the JupyterLab UI.  
 > 2. **Permanent solution:** Recreate or provision new clusters using declarative creation-time properties baked in (see [Production Cluster Provisioning Reference](#production-cluster-provisioning-reference) below).
+
+> [!IMPORTANT]
+> **Architectural Constraint: Why Jupyter Gateway Idle Culling Cannot Be Enforced via Cluster Properties or Initialization Actions on Multi-Tenant Dataproc:**  
+> You may notice that `dataproc:jupyter.cull.*` properties are omitted from the cluster provisioning template. This is due to a fundamental Google Cloud Dataproc architectural constraint:  
+> 1. **No Native Property Mapping:** Dataproc does not recognize `dataproc:jupyter.cull.*` as an internal configuration prefix (gcloud emits `WARNING: Property 'dataproc:jupyter.cull.idle.timeout' is not a supported property`). Dataproc records the value in GCE cluster metadata, but **never writes it to `/etc/jupyter/jupyter_kernel_gateway_config.py`** on the VM. The VM daemon remains hardcoded to Dataproc's base image default of **12 hours** (`cull_idle_timeout = 43200`).  
+> 2. **Initialization Actions Blocked:** Dataproc explicitly rejects `--initialization-actions` on secure multi-tenant clusters (`INVALID_ARGUMENT: Initialization actions are not supported for secure multi-tenant clusters`).  
+> 3. **Kernel Gateway Requires Multi-Tenancy:** Dataproc's component activation scripts enforce that `JUPYTER_KERNEL_GATEWAY` is **only** supported when multi-tenancy is active (`if ! is_multi_tenant_enabled; then log_and_fail "Jupyter Kernel Gateway is only supported in multi-tenant clusters"`).  
+>  
+> **How to enforce automated daemon culling:** To enforce kernel culling at the OS daemon level on Dataproc multi-tenant clusters, organizations must bake the configuration into a **Dataproc Custom Image** using `generate_custom_image.py`.  
+> **The Active Cluster Safety Net:** On standard multi-tenant clusters without custom images, the **YARN Application Lifetime Reaper** (`yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true` and `yarn.resourcemanager.app.max-lifetime=86400`) **IS** natively translated into `/etc/hadoop/conf/yarn-site.xml` and enforced by Hadoop YARN to terminate runaway or abandoned applications after 24 hours. For daytime idle session hygiene, `gateway-diag` provides the vital observability to detect and terminate idle sessions before they exhaust AM capacity.
 
 #### How to Kill Orphaned YARN Applications on Running Clusters
 
@@ -415,14 +424,7 @@ CLUSTER_PROPERTIES=(
   # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
   "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
 
-  # === Group 6: Jupyter Kernel Gateway Idle Culling ===
-  # Automatically terminate idle kernels after 2 hours (7200s), even with open browser tabs.
-  # Polls every 5 minutes (300s).
-  "dataproc:jupyter.cull.idle.timeout=7200"
-  "dataproc:jupyter.cull.connected=true"
-  "dataproc:jupyter.cull.interval=300"
-
-  # === Group 7: YARN Application Lifetime Reaper (Safety Net) ===
+  # === Group 6: YARN Application Lifetime Reaper (Safety Net) ===
   # Automatically terminate any YARN application running longer than 24 hours (86400s).
   # Prevents abandoned interactive sessions from permanently occupying AM slots.
   "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
