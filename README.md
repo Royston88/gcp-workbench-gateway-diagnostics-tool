@@ -574,7 +574,7 @@ The JSON output provides complete, machine-readable telemetry across all checks,
 
 ```json
 {
-  "tool_version": "0.1.0",
+  "tool_version": "0.2.0",
   "project_id": "kenly-lakehouse-dev-1",
   "region_id": "us-central1",
   "cluster_name": "pyspark-cluster-dev-multitenant",
