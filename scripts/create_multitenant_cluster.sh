@@ -18,17 +18,29 @@
 # Script: create_multitenant_cluster.sh
 # Description: Provisions a hardened, enterprise multi-tenant Dataproc cluster
 #              optimized for Vertex AI Workbench with Jupyter Kernel Gateway,
+#              automated idle kernel culling, YARN ApplicationMaster capacity
+#              headroom, YARN application lifetime reaping, and Apache Iceberg
+#              with BigQuery Metastore Catalog integration.
 #              YARN ApplicationMaster capacity headroom, YARN application
 #              lifetime reaping, and Apache Iceberg with BigQuery Metastore
 #              Catalog integration.
 #
 # Usage:
-#   ./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION]
+#   ./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]
 #
 # Examples:
 #   ./scripts/create_multitenant_cluster.sh
 #   ./scripts/create_multitenant_cluster.sh my-pyspark-cluster
 #   ./scripts/create_multitenant_cluster.sh my-pyspark-cluster my-project us-central1
+#   ./scripts/create_multitenant_cluster.sh my-pyspark-cluster my-project us-central1 "alice@example.com:sa1@my-project.iam.gserviceaccount.com"
+#
+# Environment Variables (Optional):
+#   USER_MAPPING        Custom multi-tenant user mapping string
+#   ZONE                Compute Engine zone (defaults to ${REGION}-a)
+#   NETWORK_TAGS        Firewall network tags (defaults to "dataproc-internal")
+#   ENABLE_ICEBERG      Set to "true" to include Apache Iceberg & BigQuery Metastore Catalog (defaults to "false")
+#   ICEBERG_WAREHOUSE   GCS warehouse path for Iceberg (defaults to gs://${PROJECT_ID}-iceberg)
+#   ICEBERG_CATALOG_JAR Optional custom Iceberg BigQuery Catalog JAR path/URL
 # =============================================================================
 
 set -euo pipefail
@@ -38,7 +50,14 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 TIMESTAMP="$(date +%Y%m%d%H%M%S)"
 CLUSTER_NAME="${1:-"pyspark-cluster-multitenant-${TIMESTAMP}"}"
-PROJECT_ID="${2:-$(gcloud config get-value project 2>/dev/null || echo "kenly-lakehouse-dev-1")}"
+PROJECT_ID="${2:-$(gcloud config get-value project 2>/dev/null || echo "")}"
+if [[ -z "${PROJECT_ID}" ]]; then
+  echo "ERROR: Google Cloud Project ID is required." >&2
+  echo "Please specify it as argument 2, set it via 'gcloud config set project <PROJECT_ID>', or export PROJECT_ID." >&2
+  echo "Usage: $0 [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]" >&2
+  exit 1
+fi
+
 REGION="${3:-$(gcloud config get-value dataproc/region 2>/dev/null || echo "us-central1")}"
 ZONE="${ZONE:-"${REGION}-a"}"
 
@@ -48,30 +67,50 @@ MASTER_BOOT_DISK_SIZE="1000GB"
 NUM_WORKERS=2
 WORKER_MACHINE_TYPE="n1-standard-8"
 WORKER_BOOT_DISK_SIZE="1000GB"
-NETWORK_TAGS="dataproc-internal"
+NETWORK_TAGS="${NETWORK_TAGS:-"dataproc-internal"}"
 
-# Multi-tenancy user mapping: maps Dataproc system users and human identities to proxy service accounts
-# Note: Dataproc extracts username prefixes (before @). Every entry MUST have a unique prefix.
-DEFAULT_USER_MAPPING="admin@kenly.altostrat.com:admin-svc@${PROJECT_ID}.iam.gserviceaccount.com"
-DEFAULT_USER_MAPPING="${DEFAULT_USER_MAPPING},ds_user_1@kenly.altostrat.com:ds-user-1-svc@${PROJECT_ID}.iam.gserviceaccount.com"
-DEFAULT_USER_MAPPING="${DEFAULT_USER_MAPPING},ds-user-1-svc@${PROJECT_ID}.iam.gserviceaccount.com:ds-user-1-svc@${PROJECT_ID}.iam.gserviceaccount.com"
-DEFAULT_USER_MAPPING="${DEFAULT_USER_MAPPING},ds-user-2-svc@${PROJECT_ID}.iam.gserviceaccount.com:ds-user-2-svc@${PROJECT_ID}.iam.gserviceaccount.com"
-DEFAULT_USER_MAPPING="${DEFAULT_USER_MAPPING},ds-user-3-svc@${PROJECT_ID}.iam.gserviceaccount.com:ds-user-3-svc@${PROJECT_ID}.iam.gserviceaccount.com"
-USER_MAPPING="${USER_MAPPING:-"${DEFAULT_USER_MAPPING}"}"
+# -----------------------------------------------------------------------------
+# Multi-Tenancy User Mapping Resolution
+# -----------------------------------------------------------------------------
+# Format: "<HUMAN_OR_CLIENT_EMAIL>:<EXECUTION_SERVICE_ACCOUNT>"
+# Note: Dataproc extracts Linux usernames from email prefixes (before @).
+#       Every user entry MUST yield a distinct username prefix.
+USER_MAPPING="${4:-${USER_MAPPING:-""}}"
 
-ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-"gs://${PROJECT_ID}-iceberg-1"}"
-ICEBERG_TMP_BUCKET="${ICEBERG_TMP_BUCKET:-"https://storage.googleapis.com/${PROJECT_ID}-tmp"}"
+if [[ -z "${USER_MAPPING}" ]]; then
+  CURRENT_USER="$(gcloud config get-value account 2>/dev/null || echo "")"
+  PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)" 2>/dev/null || echo "")"
+  if [[ -n "${CURRENT_USER}" && -n "${PROJECT_NUMBER}" ]]; then
+    DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+    echo "Notice: USER_MAPPING not specified. Auto-configuring default mapping for active identity:"
+    echo "        '${CURRENT_USER}' -> '${DEFAULT_SA}'"
+    USER_MAPPING="${CURRENT_USER}:${DEFAULT_SA}"
+  else
+    echo "ERROR: Multi-tenancy user mapping could not be auto-detected." >&2
+    echo "Please specify USER_MAPPING as argument 4 or set the USER_MAPPING environment variable." >&2
+    echo "Example: USER_MAPPING=\"developer@example.com:dataproc-runner@${PROJECT_ID}.iam.gserviceaccount.com\"" >&2
+    exit 1
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Optional Apache Iceberg & BigQuery Metastore Catalog Settings
+# -----------------------------------------------------------------------------
+ENABLE_ICEBERG="${ENABLE_ICEBERG:-"false"}"
+ICEBERG_WAREHOUSE="${ICEBERG_WAREHOUSE:-"gs://${PROJECT_ID}-iceberg"}"
+ICEBERG_CATALOG_JAR="${ICEBERG_CATALOG_JAR:-""}"
 
 echo "============================================================================="
 echo "Dataproc Multi-Tenant Cluster Provisioning"
 echo "============================================================================="
-echo "Cluster Name:  ${CLUSTER_NAME}"
-echo "Project ID:    ${PROJECT_ID}"
-echo "Region / Zone: ${REGION} / ${ZONE}"
-echo "Image Version: ${IMAGE_VERSION}"
-echo "Master Node:   1x ${MASTER_MACHINE_TYPE} (${MASTER_BOOT_DISK_SIZE})"
-echo "Worker Nodes:  ${NUM_WORKERS}x ${WORKER_MACHINE_TYPE} (${WORKER_BOOT_DISK_SIZE})"
-echo "User Mapping:  ${USER_MAPPING}"
+echo "Cluster Name:   ${CLUSTER_NAME}"
+echo "Project ID:     ${PROJECT_ID}"
+echo "Region / Zone:  ${REGION} / ${ZONE}"
+echo "Image Version:  ${IMAGE_VERSION}"
+echo "Master Node:    1x ${MASTER_MACHINE_TYPE} (${MASTER_BOOT_DISK_SIZE})"
+echo "Worker Nodes:   ${NUM_WORKERS}x ${WORKER_MACHINE_TYPE} (${WORKER_BOOT_DISK_SIZE})"
+echo "User Mapping:   ${USER_MAPPING}"
+echo "Enable Iceberg: ${ENABLE_ICEBERG}"
 echo "============================================================================="
 
 # -----------------------------------------------------------------------------
@@ -99,28 +138,37 @@ CLUSTER_PROPERTIES=(
   "spark:spark.sql.cbo.enabled=true"
   "spark:spark.sql.optimizer.runtime.bloomFilter.join.pattern.enabled=true"
 
-  # === Group 4: Apache Iceberg Runtime & BigQuery Metastore Catalog ===
-  # Configures Spark Iceberg 1.6.1 runtime and BigQuery Metastore Catalog integration
-  "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
-  "spark:spark.jars=https://storage-download.googleapis.com/maven-central/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,${ICEBERG_TMP_BUCKET}/iceberg-bigquery-catalog-1.6.1-1.0.1-beta.jar"
-  "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
-  "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
-  "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
-  "spark:spark.sql.catalog.my_catalog.gcp_location=${REGION}"
-  "spark:spark.sql.catalog.my_catalog.gcp_project=${PROJECT_ID}"
-  "spark:spark.sql.catalog.my_catalog.warehouse=${ICEBERG_WAREHOUSE}"
-
-  # === Group 5: Dataproc Multi-Tenancy Engine ===
+  # === Group 4: Dataproc Multi-Tenancy Engine ===
   # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
   "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
 
-  # === Group 6: YARN Application Lifetime Reaper (Safety Net) ===
+  # === Group 5: YARN Application Lifetime Reaper (Safety Net) ===
   # Automatically terminate any YARN application running longer than 24 hours (86400s).
   # Prevents abandoned interactive sessions from permanently occupying AM slots.
   "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
   "yarn:yarn.resourcemanager.app.max-lifetime=86400"
   "yarn:yarn.resourcemanager.app.default-lifetime=86400"
 )
+
+# === Optional Group 6: Apache Iceberg Runtime & BigQuery Metastore Catalog ===
+if [[ "${ENABLE_ICEBERG}" == "true" ]]; then
+  echo "Configuring Apache Iceberg and BigQuery Metastore Catalog properties..."
+  ICEBERG_JARS="https://storage-download.googleapis.com/maven-central/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar"
+  if [[ -n "${ICEBERG_CATALOG_JAR}" ]]; then
+    ICEBERG_JARS="${ICEBERG_JARS},${ICEBERG_CATALOG_JAR}"
+  fi
+
+  CLUSTER_PROPERTIES+=(
+    "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+    "spark:spark.jars=${ICEBERG_JARS}"
+    "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+    "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
+    "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
+    "spark:spark.sql.catalog.my_catalog.gcp_location=${REGION}"
+    "spark:spark.sql.catalog.my_catalog.gcp_project=${PROJECT_ID}"
+    "spark:spark.sql.catalog.my_catalog.warehouse=${ICEBERG_WAREHOUSE}"
+  )
+fi
 
 # -----------------------------------------------------------------------------
 # Join Properties with gcloud Custom Delimiter Syntax (^|^...)

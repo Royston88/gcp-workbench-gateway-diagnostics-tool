@@ -425,7 +425,7 @@ A ready-to-use provisioning script is included in the repository at [`scripts/cr
 ```bash
 # Make script executable and run:
 chmod +x scripts/create_multitenant_cluster.sh
-./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION]
+./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]
 ```
 
 ### Declarative `gcloud` Creation Template (Grouped Properties)
@@ -458,27 +458,26 @@ CLUSTER_PROPERTIES=(
   "spark:spark.sql.cbo.enabled=true"
   "spark:spark.sql.optimizer.runtime.bloomFilter.join.pattern.enabled=true"
 
-  # === Group 4: Apache Iceberg Runtime & BigQuery Metastore Catalog ===
-  # Configures Spark Iceberg 1.6.1 runtime and BigQuery Metastore Catalog integration
-  "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
-  "spark:spark.jars=https://storage-download.googleapis.com/maven-central/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.6.1/iceberg-spark-runtime-3.5_2.12-1.6.1.jar,gs://<PROJECT_ID>-tmp/iceberg-bigquery-catalog-1.6.1-1.0.1-beta.jar"
-  "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
-  "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
-  "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
-  "spark:spark.sql.catalog.my_catalog.gcp_location=<REGION>"
-  "spark:spark.sql.catalog.my_catalog.gcp_project=<PROJECT_ID>"
-  "spark:spark.sql.catalog.my_catalog.warehouse=gs://<PROJECT_ID>-iceberg-1"
-
-  # === Group 5: Dataproc Multi-Tenancy Engine ===
+  # === Group 4: Dataproc Multi-Tenancy Engine ===
   # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
   "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
 
-  # === Group 6: YARN Application Lifetime Reaper (Safety Net) ===
+  # === Group 5: YARN Application Lifetime Reaper (Safety Net) ===
   # Automatically terminate any YARN application running longer than 24 hours (86400s).
   # Prevents abandoned interactive sessions from permanently occupying AM slots.
   "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
   "yarn:yarn.resourcemanager.app.max-lifetime=86400"
   "yarn:yarn.resourcemanager.app.default-lifetime=86400"
+
+  # === Group 6: (Optional) Apache Iceberg Runtime & BigQuery Metastore Catalog ===
+  # Uncomment to enable Spark Iceberg runtime with BigQuery Metastore Catalog integration
+  # "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+  # "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+  # "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
+  # "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
+  # "spark:spark.sql.catalog.my_catalog.gcp_location=<REGION>"
+  # "spark:spark.sql.catalog.my_catalog.gcp_project=<PROJECT_ID>"
+  # "spark:spark.sql.catalog.my_catalog.warehouse=gs://<PROJECT_ID>-iceberg"
 )
 
 # -----------------------------------------------------------------------------
@@ -499,7 +498,7 @@ gcloud dataproc clusters create <CLUSTER_NAME> \
   --optional-components=JUPYTER_KERNEL_GATEWAY \
   --enable-component-gateway \
   --tags=dataproc-internal \
-  --secure-multi-tenancy-user-mapping="admin:admin,<USER_OR_WORKBENCH_SA>:<PROXY_USER>" \
+  --secure-multi-tenancy-user-mapping="<USER_EMAIL>:<EXECUTION_SERVICE_ACCOUNT>" \
   --properties="^|^$(IFS='|'; echo "${CLUSTER_PROPERTIES[*]}")"
 ```
 
@@ -575,7 +574,7 @@ The JSON output provides complete, machine-readable telemetry across all checks,
 ```json
 {
   "tool_version": "0.2.0",
-  "project_id": "kenly-lakehouse-dev-1",
+  "project_id": "<PROJECT_ID>",
   "region_id": "us-central1",
   "cluster_name": "pyspark-cluster-dev-multitenant",
   "overall_status": "FAIL",
