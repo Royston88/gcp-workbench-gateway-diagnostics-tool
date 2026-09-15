@@ -315,7 +315,7 @@ Exit code `1`. Reading it line by line:
 
 | Finding | Fix |
 |---|---|
-| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Shut down idle kernels via JupyterLab (*Running Terminals and Kernels*) or kill orphaned YARN applications via master-local job (see below).<br>• **At cluster creation:** Enforce YARN application lifetime reaping (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). *(Note: Dataproc multi-tenant clusters do not enforce OS daemon culling via cluster properties or init actions; see [Appendix: Multi-Tenant Architectural Constraints](#appendix-multi-tenant-architectural-constraints) below).* |
+| **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Shut down idle kernels via JupyterLab (*Running Terminals and Kernels*) or kill orphaned YARN applications via master-local job (see below).<br>• **At cluster creation:** Enforce YARN application lifetime reaping (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). *(Note: Dataproc multi-tenant clusters do not enforce OS daemon culling via cluster properties or init actions; see [Appendix B: Multi-Tenant Architectural Constraints](#appendix-b-multi-tenant-architectural-constraints) below).* |
 | **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` *(Required at creation time; cannot be modified on running clusters).* |
 | **Check 3 FAIL** — launch timeouts | • **On running clusters:** Resolve Check 2 (AM capacity) first; launch timeouts are almost always downstream symptoms of AM queuing rather than slow container starts.<br>• **At cluster creation:** Configure higher launch timeout if custom container environments require longer cold starts. *(Cannot be modified on running clusters).* |
 | **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers. |
@@ -387,104 +387,6 @@ print("STDOUT:", res.stdout)
 print("STDERR:", res.stderr)
 sys.exit(res.returncode)
 '
-```
-
----
-
-## Production Cluster Provisioning Reference
-
-To prevent kernel exhaustion, orphaned YARN drivers, and AM starvation from day one, provision Dataproc multi-tenant clusters with declarative properties baked in.
-
-> [!NOTE]
-> For the underlying technical constraints explaining why these settings must be configured at cluster creation time and cannot be modified on running clusters, see [Appendix: Multi-Tenant Architectural Constraints](#appendix-multi-tenant-architectural-constraints).
-
-A ready-to-use provisioning script is included in the repository at [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh):
-
-```bash
-# 1. Quick start with environment file:
-# Copy the generic demo template to scripts/.env.local (gitignored):
-cp scripts/.env.example scripts/.env.local
-
-# Edit scripts/.env.local with your project details, then run:
-chmod +x scripts/create_multitenant_cluster.sh
-./scripts/create_multitenant_cluster.sh
-
-# Or pass parameters directly via positional arguments:
-./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]
-```
-
-### Declarative `gcloud` Creation Template (Grouped Properties)
-
-You can copy and paste the entire block below directly into your terminal. The configuration properties are cleanly categorized into subsystem groups and joined with `gcloud`'s custom delimiter syntax (`^|^...`) to prevent embedded commas in jar URLs from breaking argument parsing:
-
-```bash
-# -----------------------------------------------------------------------------
-# 1. Define Cluster Configuration Properties by Subsystem Group
-# -----------------------------------------------------------------------------
-CLUSTER_PROPERTIES=(
-  # === Group 1: YARN Capacity Scheduler & AM Admission Limits ===
-  # Critical: Allows ApplicationMasters to consume up to 80% of total queue memory.
-  # Prevents kernel launch HTTP 500 / TimeoutError when free cluster memory is abundant.
-  "capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8"
-
-  # === Group 2: Spark Driver, Executor & AM Compute Sizing ===
-  # Driver (2g), AM container overhead (640m), 2 Executors (2 cores, 2g each)
-  "spark:spark.driver.memory=2g"
-  "spark:spark.driver.maxResultSize=1920m"
-  "spark:spark.executor.memory=2g"
-  "spark:spark.executor.cores=2"
-  "spark:spark.executor.instances=2"
-  "spark:spark.yarn.am.memory=640m"
-  "spark:spark.scheduler.mode=FAIR"
-  "spark:spark.executorEnv.OPENBLAS_NUM_THREADS=1"
-
-  # === Group 3: Spark SQL Query Optimization ===
-  # Enables cost-based optimizer and runtime bloom filter joins
-  "spark:spark.sql.cbo.enabled=true"
-  "spark:spark.sql.optimizer.runtime.bloomFilter.join.pattern.enabled=true"
-
-  # === Group 4: Dataproc Multi-Tenancy Engine ===
-  # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
-  "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
-
-  # === Group 5: YARN Application Lifetime Reaper (Safety Net) ===
-  # Automatically terminate any YARN application running longer than 24 hours (86400s).
-  # Prevents abandoned interactive sessions from permanently occupying AM slots.
-  "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
-  "yarn:yarn.resourcemanager.app.max-lifetime=86400"
-  "yarn:yarn.resourcemanager.app.default-lifetime=86400"
-
-  # === Group 6: (Optional) Apache Iceberg Runtime & BigQuery Metastore Catalog ===
-  # Uncomment to enable Spark Iceberg runtime with BigQuery Metastore Catalog integration
-  # "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
-  # "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
-  # "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
-  # "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
-  # "spark:spark.sql.catalog.my_catalog.gcp_location=<REGION>"
-  # "spark:spark.sql.catalog.my_catalog.gcp_project=<PROJECT_ID>"
-  # "spark:spark.sql.catalog.my_catalog.warehouse=gs://<PROJECT_ID>-iceberg"
-)
-
-# -----------------------------------------------------------------------------
-# 2. Execute Cluster Creation (Single Copy-Pasteable Invocation)
-# -----------------------------------------------------------------------------
-gcloud dataproc clusters create <CLUSTER_NAME> \
-  --project=<PROJECT_ID> \
-  --region=<REGION> \
-  --zone=<REGION>-a \
-  --image-version=2.3-debian12 \
-  --master-machine-type=n1-standard-4 \
-  --master-boot-disk-type=pd-standard \
-  --master-boot-disk-size=1000GB \
-  --num-workers=2 \
-  --worker-machine-type=n1-standard-8 \
-  --worker-boot-disk-type=pd-standard \
-  --worker-boot-disk-size=1000GB \
-  --optional-components=JUPYTER_KERNEL_GATEWAY \
-  --enable-component-gateway \
-  --tags=dataproc-internal \
-  --secure-multi-tenancy-user-mapping="<USER_EMAIL>:<EXECUTION_SERVICE_ACCOUNT>" \
-  --properties="^|^$(IFS='|'; echo "${CLUSTER_PROPERTIES[*]}")"
 ```
 
 ---
@@ -626,7 +528,105 @@ The JSON output provides complete, machine-readable telemetry across all checks,
 
 ---
 
-## Appendix: Multi-Tenant Architectural Constraints
+## Appendix A: Sample Cluster Provisioning Reference (`scripts/`)
+
+To prevent kernel exhaustion, orphaned YARN drivers, and AM starvation from day one, provision Dataproc multi-tenant clusters with declarative properties baked in.
+
+> [!NOTE]
+> For the underlying technical constraints explaining why these settings must be configured at cluster creation time and cannot be modified on running clusters, see [Appendix B: Multi-Tenant Architectural Constraints](#appendix-b-multi-tenant-architectural-constraints).
+
+A ready-to-use provisioning script is included in the repository at [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh):
+
+```bash
+# 1. Quick start with environment file:
+# Copy the generic demo template to scripts/.env.local (gitignored):
+cp scripts/.env.example scripts/.env.local
+
+# Edit scripts/.env.local with your project details, then run:
+chmod +x scripts/create_multitenant_cluster.sh
+./scripts/create_multitenant_cluster.sh
+
+# Or pass parameters directly via positional arguments:
+./scripts/create_multitenant_cluster.sh [CLUSTER_NAME] [PROJECT_ID] [REGION] [USER_MAPPING]
+```
+
+### Declarative `gcloud` Creation Template (Grouped Properties)
+
+You can copy and paste the entire block below directly into your terminal. The configuration properties are cleanly categorized into subsystem groups and joined with `gcloud`'s custom delimiter syntax (`^|^...`) to prevent embedded commas in jar URLs from breaking argument parsing:
+
+```bash
+# -----------------------------------------------------------------------------
+# 1. Define Cluster Configuration Properties by Subsystem Group
+# -----------------------------------------------------------------------------
+CLUSTER_PROPERTIES=(
+  # === Group 1: YARN Capacity Scheduler & AM Admission Limits ===
+  # Critical: Allows ApplicationMasters to consume up to 80% of total queue memory.
+  # Prevents kernel launch HTTP 500 / TimeoutError when free cluster memory is abundant.
+  "capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8"
+
+  # === Group 2: Spark Driver, Executor & AM Compute Sizing ===
+  # Driver (2g), AM container overhead (640m), 2 Executors (2 cores, 2g each)
+  "spark:spark.driver.memory=2g"
+  "spark:spark.driver.maxResultSize=1920m"
+  "spark:spark.executor.memory=2g"
+  "spark:spark.executor.cores=2"
+  "spark:spark.executor.instances=2"
+  "spark:spark.yarn.am.memory=640m"
+  "spark:spark.scheduler.mode=FAIR"
+  "spark:spark.executorEnv.OPENBLAS_NUM_THREADS=1"
+
+  # === Group 3: Spark SQL Query Optimization ===
+  # Enables cost-based optimizer and runtime bloom filter joins
+  "spark:spark.sql.cbo.enabled=true"
+  "spark:spark.sql.optimizer.runtime.bloomFilter.join.pattern.enabled=true"
+
+  # === Group 4: Dataproc Multi-Tenancy Engine ===
+  # Mandatory when Jupyter Kernel Gateway is installed on Dataproc
+  "dataproc:dataproc.dynamic.multi.tenancy.enabled=true"
+
+  # === Group 5: YARN Application Lifetime Reaper (Safety Net) ===
+  # Automatically terminate any YARN application running longer than 24 hours (86400s).
+  # Prevents abandoned interactive sessions from permanently occupying AM slots.
+  "yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true"
+  "yarn:yarn.resourcemanager.app.max-lifetime=86400"
+  "yarn:yarn.resourcemanager.app.default-lifetime=86400"
+
+  # === Group 6: (Optional) Apache Iceberg Runtime & BigQuery Metastore Catalog ===
+  # Uncomment to enable Spark Iceberg runtime with BigQuery Metastore Catalog integration
+  # "spark:spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+  # "spark:spark.jars.packages=org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.6.1"
+  # "spark:spark.sql.catalog.my_catalog=org.apache.iceberg.spark.SparkCatalog"
+  # "spark:spark.sql.catalog.my_catalog.catalog-impl=org.apache.iceberg.gcp.bigquery.BigQueryMetastoreCatalog"
+  # "spark:spark.sql.catalog.my_catalog.gcp_location=<REGION>"
+  # "spark:spark.sql.catalog.my_catalog.gcp_project=<PROJECT_ID>"
+  # "spark:spark.sql.catalog.my_catalog.warehouse=gs://<PROJECT_ID>-iceberg"
+)
+
+# -----------------------------------------------------------------------------
+# 2. Execute Cluster Creation (Single Copy-Pasteable Invocation)
+# -----------------------------------------------------------------------------
+gcloud dataproc clusters create <CLUSTER_NAME> \
+  --project=<PROJECT_ID> \
+  --region=<REGION> \
+  --zone=<REGION>-a \
+  --image-version=2.3-debian12 \
+  --master-machine-type=n1-standard-4 \
+  --master-boot-disk-type=pd-standard \
+  --master-boot-disk-size=1000GB \
+  --num-workers=2 \
+  --worker-machine-type=n1-standard-8 \
+  --worker-boot-disk-type=pd-standard \
+  --worker-boot-disk-size=1000GB \
+  --optional-components=JUPYTER_KERNEL_GATEWAY \
+  --enable-component-gateway \
+  --tags=dataproc-internal \
+  --secure-multi-tenancy-user-mapping="<USER_EMAIL>:<EXECUTION_SERVICE_ACCOUNT>" \
+  --properties="^|^$(IFS='|'; echo "${CLUSTER_PROPERTIES[*]}")"
+```
+
+---
+
+## Appendix B: Multi-Tenant Architectural Constraints
 
 This appendix documents critical Google Cloud Dataproc architectural constraints that dictate why cluster configuration and automated culling must be handled declaratively at creation time (as implemented in [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh)).
 
@@ -643,7 +643,7 @@ This appendix documents critical Google Cloud Dataproc architectural constraints
 >  
 > **Recommended Actions:**  
 > 1. **Immediate remediation on existing clusters:** Terminate orphaned YARN applications using the master-local PySpark job command (see [Approach 3](#approach-3-killing-orphaned-yarn-applications-safety-fallback)), and shut down idle sessions via the JupyterLab UI.  
-> 2. **Permanent solution:** Recreate or provision new clusters using declarative creation-time properties baked in (see [Production Cluster Provisioning Reference](#production-cluster-provisioning-reference), or use the reference script in [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh)).
+> 2. **Permanent solution:** Recreate or provision new clusters using declarative creation-time properties baked in (see [Sample Cluster Provisioning Reference](#appendix-a-sample-cluster-provisioning-reference-scripts), or use the reference script in [`scripts/create_multitenant_cluster.sh`](scripts/create_multitenant_cluster.sh)).
 
 ### 2. Why Jupyter Gateway Idle Culling Cannot Be Enforced via Cluster Properties or Initialization Actions
 
