@@ -73,6 +73,11 @@ load_env_file() {
 if [[ -n "${ENV_FILE:-}" ]]; then
   load_env_file "${ENV_FILE}"
 else
+  # Check scripts/ directory first (preferred location)
+  load_env_file "${SCRIPT_DIR}/.env.example"
+  load_env_file "${SCRIPT_DIR}/.env"
+  load_env_file "${SCRIPT_DIR}/.env.local"
+  # Also check repository root as fallback
   load_env_file "${REPO_ROOT}/.env.example"
   load_env_file "${REPO_ROOT}/.env"
   load_env_file "${REPO_ROOT}/.env.local"

@@ -424,10 +424,10 @@ A ready-to-use provisioning script is included in the repository at [`scripts/cr
 
 ```bash
 # 1. Quick start with environment file:
-# Copy the generic demo template to .env.local (gitignored):
-cp .env.example .env.local
+# Copy the generic demo template to scripts/.env.local (gitignored):
+cp scripts/.env.example scripts/.env.local
 
-# Edit .env.local with your project details, then run:
+# Edit scripts/.env.local with your project details, then run:
 chmod +x scripts/create_multitenant_cluster.sh
 ./scripts/create_multitenant_cluster.sh
 
