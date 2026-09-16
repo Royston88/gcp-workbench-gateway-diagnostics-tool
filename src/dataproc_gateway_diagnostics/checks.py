@@ -232,10 +232,13 @@ def check_kernel_sessions(
         else {"is_workbench": False}
     )
 
-    # 2. External Probe: If not running inside Workbench, query Workbench instance inventory
+    # 2. External Probe: Query Workbench instance inventory across project (if permitted)
     wb_inventory: Dict[str, Dict[str, Any]] = {}
-    if not in_situ_wb.get("is_workbench") and hasattr(client, "workbench_instances"):
-        wb_inventory = client.workbench_instances()
+    if hasattr(client, "workbench_instances"):
+        try:
+            wb_inventory = client.workbench_instances()
+        except Exception:
+            wb_inventory = {}
 
     # Cache for looked-up notebook files and remote sessions to avoid duplicate queries
     looked_up_notebooks: Dict[str, Optional[str]] = {}
@@ -279,20 +282,23 @@ def check_kernel_sessions(
 
         last_str = kernel.get("last_activity", "")
 
-        # Mode A: Running In Situ inside Workbench VM
+        # Step 1: Local In Situ Match (Check if kernel belongs to active Jupyter session on this local VM)
+        is_local_match = False
         if in_situ_wb.get("is_workbench"):
-            wb_vm = in_situ_wb.get("vm_name")
-            wb_owner = in_situ_wb.get("owner")
             sess_info = (
                 in_situ_wb.get("sessions_by_kernel_id", {}).get(k_id)
                 or in_situ_wb.get("sessions_by_last_activity", {}).get(last_str)
             )
             if sess_info:
+                is_local_match = True
+                wb_vm = in_situ_wb.get("vm_name")
+                wb_state = "ACTIVE (Local VM)"
+                wb_owner = in_situ_wb.get("owner")
                 matched_wb_id = sess_info.get("session_id")
                 wb_notebook = sess_info.get("notebook_path") or sess_info.get("notebook_name")
 
-        # Mode B: Running outside Workbench (Admin CLI / Cloudtop)
-        elif assoc_app and wb_inventory:
+        # Step 2: Global / External Resolution (If not matched to local VM, resolve via inventory if available)
+        if not is_local_match and assoc_app and wb_inventory:
             yarn_user = assoc_app.get("user", "")
             wb_inst = wb_inventory.get(yarn_user) or wb_inventory.get(yarn_user.lower())
             if wb_inst:
@@ -403,12 +409,24 @@ def check_kernel_sessions(
             wb_vm_display = f"{wb_vm}{state_str}{confidence_str}{cand_str}"
             wb_vm_explanation = None
         else:
-            wb_vm_display = "[Unresolved] (Missing notebooks.instances.list permission or no matching VM for identity)"
-            wb_vm_explanation = "Missing notebooks.instances.list permission or no matching VM for identity"
+            if in_situ_wb.get("is_workbench"):
+                yarn_u = assoc_app.get("user") if assoc_app else None
+                if yarn_u:
+                    wb_vm_display = f"[External to this VM (YARN user: {yarn_u})]"
+                    wb_vm_explanation = f"Kernel belongs to external tenant '{yarn_u}' (no active session on {in_situ_wb.get('vm_name')})"
+                else:
+                    wb_vm_display = "[External to this VM]"
+                    wb_vm_explanation = f"Kernel is not associated with any local session on {in_situ_wb.get('vm_name')}"
+            else:
+                wb_vm_display = "[Unresolved] (Missing notebooks.instances.list permission or no matching VM for identity)"
+                wb_vm_explanation = "Missing notebooks.instances.list permission or no matching VM for identity"
 
         if wb_owner:
             wb_owner_display = wb_owner
             wb_owner_explanation = None
+        elif in_situ_wb.get("is_workbench") and assoc_app and assoc_app.get("user"):
+            wb_owner_display = assoc_app.get("user")
+            wb_owner_explanation = "Extracted from YARN application owner"
         else:
             wb_owner_display = "[Unresolved] (Workbench instance metadata unavailable)"
             wb_owner_explanation = "Workbench instance metadata unavailable"
@@ -416,6 +434,9 @@ def check_kernel_sessions(
         if wb_notebook:
             wb_notebook_display = wb_notebook
             wb_notebook_explanation = None
+        elif in_situ_wb.get("is_workbench") and not is_local_match:
+            wb_notebook_display = "[External / Headless Session]"
+            wb_notebook_explanation = f"No active notebook session mapped on local instance {in_situ_wb.get('vm_name')}"
         else:
             wb_notebook_display = "[Unresolved] (No active /lab/tree/ referer found in recent GCE serial console logs)"
             wb_notebook_explanation = "No active /lab/tree/ referer found in recent GCE serial console logs"
@@ -423,6 +444,9 @@ def check_kernel_sessions(
         if matched_wb_id:
             wb_ui_id_display = f"{matched_wb_id[:8]} ({matched_wb_id})"
             wb_ui_id_explanation = None
+        elif in_situ_wb.get("is_workbench") and not is_local_match:
+            wb_ui_id_display = "[External to this VM]"
+            wb_ui_id_explanation = "Local sidebar session UUID is only accessible within the originating VM"
         else:
             wb_ui_id_display = "[Unresolved] (Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec)"
             wb_ui_id_explanation = "Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec"
