@@ -582,8 +582,10 @@ class GatewayDiagnosticClient:
                         if not any(c.get("name") == vm_name for c in target.get("candidate_details", [])):
                             target.setdefault("candidate_details", []).append(cand_detail)
 
-            # Also index by owner and creator email & prefix
-            for user_id in filter(None, [owner, creator]):
+            # Index by the true owner (proxy-user-mail, or creator fallback if unassigned).
+            # NEVER index under creator if proxy-user-mail is assigned to a different user,
+            # as that pollutes the creator/admin pool with VMs assigned to other data scientists.
+            for user_id in filter(None, [owner]):
                 u_clean = user_id.strip()
                 c_info = {
                     "name": vm_name,
