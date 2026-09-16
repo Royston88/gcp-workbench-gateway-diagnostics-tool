@@ -375,7 +375,7 @@ def check_kernel_sessions(
                 if all_cands and best_score < 100:
                     wb_candidates = all_cands
 
-                # Try External In-Situ Probing Fallback Chain (Method 3 -> 2 -> 1)
+                # Try Remote Notebook Probing (Non-Intr. SSH via IAP)
                 remote_sessions: List[Dict[str, Any]] = []
                 method_used: Optional[str] = None
                 remote_probe_err: Optional[str] = None
@@ -467,8 +467,8 @@ def check_kernel_sessions(
             wb_ui_id_display = "[External to this VM]"
             wb_ui_id_explanation = "Local sidebar session UUID is only accessible within the originating VM"
         else:
-            wb_ui_id_display = "[Unresolved] (Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec)"
-            wb_ui_id_explanation = "Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec"
+            wb_ui_id_display = "[Unresolved] (Local sidebar session UUID; requires in-situ execution or Non-Intr. SSH)"
+            wb_ui_id_explanation = "Local sidebar session UUID; requires in-situ execution or Non-Intr. SSH"
 
         kernels_detail.append(
             {

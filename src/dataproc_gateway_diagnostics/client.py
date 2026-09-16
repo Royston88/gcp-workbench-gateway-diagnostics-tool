@@ -765,23 +765,17 @@ class GatewayDiagnosticClient:
                 "granted": True,
                 "detail": "Granted",
             },
-            "method_3_inverting_proxy": {
-                "name": "Method 3 Inverting Proxy",
-                "role": "Inverting Proxy Bearer",
-                "granted": False,
-                "detail": "Requires browser session cookie or direct SA token (HTTP 401)",
-            },
-            "method_2_iap_tunnel": {
-                "name": "Method 2 IAP Tunnel",
-                "role": "roles/iap.tunnelResourceAccessor",
-                "granted": True,
-                "detail": "Port 8080 bound to 127.0.0.1 inside VM (Connection Refused)",
-            },
-            "method_1_gce_exec": {
-                "name": "Method 1 Non-Intr. SSH",
+            "remote_probing_ssh": {
+                "name": "Non-Intr. SSH",
                 "role": "roles/iap.tunnelResourceAccessor",
                 "granted": True,
                 "detail": "Supported via IAP tunnel (--tunnel-through-iap)",
+            },
+            "remote_probing_logging": {
+                "name": "Cloud Logging Trace",
+                "role": "roles/logging.viewer",
+                "granted": True,
+                "detail": "Cloud Logging /lab/tree/ referer",
             },
         }
 
@@ -923,7 +917,7 @@ class GatewayDiagnosticClient:
             return 0
 
     # ------------------------------------------------------------------
-    # External In-Situ Probing Fallback Chain (Methods 3 -> 2 -> 1)
+    # Remote Notebook Probing (Non-Interactive SSH via IAP)
     # ------------------------------------------------------------------
     def query_remote_workbench_sessions(
         self,
@@ -933,91 +927,10 @@ class GatewayDiagnosticClient:
         instance_id: Optional[str] = None,
         timeout: float = 2.0,
     ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
-        """Queries remote Workbench /api/sessions via Method 3 -> Method 2 -> Method 1 fallback chain.
+        """Queries remote Workbench /api/sessions via Non-Interactive SSH over IAP tunnel.
 
         Returns: (sessions_list, method_name, failure_explanation)
         """
-        # Method 3: Direct Inverting Proxy REST API call (Primary)
-        if proxy_uri:
-            url = f"https://{proxy_uri.rstrip('/')}/api/sessions"
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self._token}",
-                        "Accept": "application/json",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    if resp.status == 200:
-                        data = json.loads(resp.read().decode("utf-8"))
-                        if isinstance(data, list):
-                            logger.info("Method 3 (Inverting Proxy REST) succeeded for %s", vm_name)
-                            return data, "Method 3 (Inverting Proxy REST)", None
-            except urllib.error.HTTPError as exc:
-                logger.debug(
-                    "Method 3 Inverting Proxy returned HTTP %d (%s); falling back to Method 2",
-                    exc.code,
-                    exc.reason,
-                )
-            except Exception as exc:
-                logger.debug("Method 3 Inverting Proxy error (%s); falling back to Method 2", exc)
-
-        # Method 2: Authenticated IAP TCP Tunnel (Fallback 1)
-        if vm_name and zone:
-            iap_proc = None
-            try:
-                cmd = [
-                    "gcloud",
-                    "compute",
-                    "start-iap-tunnel",
-                    vm_name,
-                    "8080",
-                    f"--zone={zone}",
-                    "--local-host-port=localhost:0",
-                    f"--project={self.project_id}",
-                ]
-                iap_proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-                )
-                port = None
-                start_wait = time.time()
-                while time.time() - start_wait < 3.0:
-                    line = iap_proc.stderr.readline() if iap_proc.stderr else ""
-                    if not line and iap_proc.stdout:
-                        line = iap_proc.stdout.readline()
-                    m = re.search(r"\[(\d+)\]", line)
-                    if m:
-                        port = int(m.group(1))
-                        break
-                    if iap_proc.poll() is not None:
-                        break
-
-                if port:
-                    tunnel_url = f"http://127.0.0.1:{port}/api/sessions"
-                    req = urllib.request.Request(
-                        tunnel_url, headers={"Accept": "application/json"}
-                    )
-                    with urllib.request.urlopen(req, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            data = json.loads(resp.read().decode("utf-8"))
-                            if isinstance(data, list):
-                                logger.info("Method 2 (IAP Tunnel) succeeded for %s", vm_name)
-                                return data, "Method 2 (IAP Tunnel)", None
-            except Exception as exc:
-                logger.debug("Method 2 IAP Tunnel failed (%s); falling back to Method 1", exc)
-            finally:
-                if iap_proc:
-                    try:
-                        iap_proc.terminate()
-                        iap_proc.wait(timeout=1.0)
-                    except Exception:
-                        try:
-                            iap_proc.kill()
-                        except Exception:
-                            pass
-
-        # Method 1: Compute Engine Non-Interactive SSH (Fallback 2)
         if vm_name and zone:
             try:
                 cmd = [
@@ -1039,15 +952,13 @@ class GatewayDiagnosticClient:
                 if out.returncode == 0 and out.stdout.strip():
                     data = json.loads(out.stdout.strip())
                     if isinstance(data, list):
-                        logger.info("Method 1 (Non-Interactive SSH) succeeded for %s", vm_name)
-                        return data, "Method 1 (Non-Interactive SSH)", None
+                        logger.info("Non-Intr. SSH succeeded for %s", vm_name)
+                        return data, "Non-Intr. SSH", None
             except Exception as exc:
-                logger.debug("Method 1 SSH exec failed (%s)", exc)
+                logger.debug("Non-Intr. SSH exec failed (%s)", exc)
 
         explanation = (
-            "Method 3 HTTP 401 single-user cookie lock; "
-            "Method 2 Port 8080 bound to localhost; "
-            "Method 1 SSO/CorpSSH required"
+            "Non-Intr. SSH unavailable (check roles/iap.tunnelResourceAccessor or SSH key permissions)"
         )
         return [], None, explanation
 

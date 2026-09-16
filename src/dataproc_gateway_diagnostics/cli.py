@@ -144,15 +144,18 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         lines.append(f"      * Signal 2 Serial Console  : {'GRANTED' if s2.get('granted') else 'MISSING'} ({s2.get('role', 'logging.entries.list')})")
         lines.append(f"      * Signal 3 Cloud Monitoring: {'GRANTED' if s3.get('granted') else 'MISSING'} ({s3.get('role', 'roles/monitoring.viewer')})")
 
-        # 3. External In-Situ Probing
-        m3 = iam.get("method_3_inverting_proxy", {})
-        m2 = iam.get("method_2_iap_tunnel", {})
-        m1 = iam.get("method_1_gce_exec", {})
-        lines.append(f"   -> External In-Situ Probing   : [✓] AVAILABLE (Fallback Chain: 3 -> 2 -> 1 -> Cloud Logging)")
-        lines.append(f"      * Method 3 Inverting Proxy : SKIPPED ({m3.get('detail')})")
-        lines.append(f"      * Method 2 IAP Tunnel      : DEGRADED ({m2.get('detail')})")
-        lines.append(f"      * Method 1 Non-Intr. SSH   : READY ({m1.get('detail')})")
-        lines.append(f"      * Safety Net Serial Trace  : ACTIVE (Cloud Logging /lab/tree/ referer)")
+        # 3. Remote Notebook Probing
+        ssh_probe = iam.get("remote_probing_ssh", {})
+        log_probe = iam.get("remote_probing_logging", {})
+        lines.append(
+            "   -> Remote Notebook Probing    : [✓] AVAILABLE (Non-Intr. SSH -> Cloud Logging Trace)"
+        )
+        lines.append(
+            f"      * Non-Intr. SSH            : READY ({ssh_probe.get('detail', 'Supported via IAP tunnel')})"
+        )
+        lines.append(
+            f"      * Cloud Logging Trace      : ACTIVE ({log_probe.get('detail', 'Cloud Logging /lab/tree/ referer')})"
+        )
         lines.append(THIN)
 
     for check in report.checks:
