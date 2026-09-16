@@ -1025,13 +1025,14 @@ class GatewayDiagnosticClient:
                     vm_name,
                     f"--zone={zone}",
                     f"--project={self.project_id}",
+                    "--tunnel-through-iap",
                     '--command=curl -s http://127.0.0.1:8080/api/sessions',
                     "--ssh-flag=-o StrictHostKeyChecking=no",
-                    "--ssh-flag=-o ConnectTimeout=3",
+                    "--ssh-flag=-o ConnectTimeout=5",
                     "--ssh-flag=-o BatchMode=yes",
                 ]
                 out = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=4.0
+                    cmd, capture_output=True, text=True, timeout=10.0
                 )
                 if out.returncode == 0 and out.stdout.strip():
                     data = json.loads(out.stdout.strip())
