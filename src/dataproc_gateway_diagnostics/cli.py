@@ -166,7 +166,11 @@ def render_text(report: GatewayDiagnosticReport) -> str:
                     lines.append(f"\n   -> {label}")
                 else:
                     lines.append(f"   -> {label}")
-            elif label.startswith("      * ") or label.startswith("   * "):
+            elif (
+                label.startswith("      * ")
+                or label.startswith("   * ")
+                or label.startswith("        - ")
+            ):
                 lines.append(f"{label:<36}: {value}")
             elif label.startswith("[Kernel]"):
                 lines.append(f"\n   -> {label:<30}: {value}")

@@ -234,9 +234,12 @@ def check_kernel_sessions(
 
     # 2. External Probe: Query Workbench instance inventory across project (if permitted)
     wb_inventory: Dict[str, Dict[str, Any]] = {}
+    wb_inventory_error = False
     if hasattr(client, "workbench_instances"):
         try:
             wb_inventory = client.workbench_instances()
+        except AccessDenied:
+            wb_inventory_error = True
         except Exception:
             wb_inventory = {}
 
@@ -355,6 +358,11 @@ def check_kernel_sessions(
                     primary_cand = best_cand
                     if best_signals:
                         confidence_str = f" ({best_score}% confidence via {', '.join(best_signals)})"
+                    elif best_score == 0:
+                        if all(c.get("state") == "STOPPED" for _, _, c in scored_candidates):
+                            confidence_str = " (0% confidence - unranked among STOPPED instances)"
+                        else:
+                            confidence_str = " (0% confidence - no signals active)"
 
                 wb_vm = primary_cand.get("name")
                 wb_state = primary_cand.get("state")
@@ -418,8 +426,16 @@ def check_kernel_sessions(
                     wb_vm_display = "[External to this VM]"
                     wb_vm_explanation = f"Kernel is not associated with any local session on {in_situ_wb.get('vm_name')}"
             else:
-                wb_vm_display = "[Unresolved] (Missing notebooks.instances.list permission or no matching VM for identity)"
-                wb_vm_explanation = "Missing notebooks.instances.list permission or no matching VM for identity"
+                if not assoc_app:
+                    wb_vm_display = "[Unresolved] (No associated YARN application or tenant identity to correlate)"
+                    wb_vm_explanation = "No associated YARN application or tenant identity to correlate"
+                elif wb_inventory_error:
+                    wb_vm_display = "[Unresolved] (Missing notebooks.instances.list permission)"
+                    wb_vm_explanation = "Missing notebooks.instances.list permission"
+                else:
+                    yarn_u = assoc_app.get("user", "")
+                    wb_vm_display = f"[Unresolved] (No matching Workbench VM found for identity '{yarn_u}')"
+                    wb_vm_explanation = f"No matching Workbench VM found for identity '{yarn_u}'"
 
         if wb_owner:
             wb_owner_display = wb_owner
@@ -427,6 +443,9 @@ def check_kernel_sessions(
         elif in_situ_wb.get("is_workbench") and assoc_app and assoc_app.get("user"):
             wb_owner_display = assoc_app.get("user")
             wb_owner_explanation = "Extracted from YARN application owner"
+        elif not wb_vm:
+            wb_owner_display = "[Unresolved] (Cannot determine owner because Workbench VM could not be identified)"
+            wb_owner_explanation = "Cannot determine owner because Workbench VM could not be identified"
         else:
             wb_owner_display = "[Unresolved] (Workbench instance metadata unavailable)"
             wb_owner_explanation = "Workbench instance metadata unavailable"
@@ -566,9 +585,9 @@ def check_kernel_sessions(
             k_id_short = kd["id"][:8] if len(kd["id"]) > 8 else kd["id"]
             result.add(f"[Kernel] {k_id_short}...", kd["name"])
             result.add("      * Workbench VM", kd["workbench_vm_display"])
-            result.add("      * Workbench Owner", kd["workbench_owner_display"])
-            result.add("      * Notebook File", kd["workbench_notebook_display"])
-            result.add("      * Workbench UI ID", kd["workbench_ui_id_display"])
+            result.add("        - Workbench Owner", kd["workbench_owner_display"])
+            result.add("        - Notebook File", kd["workbench_notebook_display"])
+            result.add("        - Workbench UI ID", kd["workbench_ui_id_display"])
             result.add(
                 "      * State",
                 f"{kd['execution_state']} (idle for {humanize_duration(kd['idle_seconds'])})",
