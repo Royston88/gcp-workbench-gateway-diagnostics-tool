@@ -1034,7 +1034,7 @@ class GatewayDiagnosticClient:
                     "--ssh-flag=-o BatchMode=yes",
                 ]
                 out = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=10.0
+                    cmd, capture_output=True, text=True, timeout=25.0
                 )
                 if out.returncode == 0 and out.stdout.strip():
                     data = json.loads(out.stdout.strip())
