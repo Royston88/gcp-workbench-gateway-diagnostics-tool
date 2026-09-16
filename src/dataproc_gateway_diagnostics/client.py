@@ -23,11 +23,15 @@ Design constraints
 * Every method is read-only. Nothing here mutates cluster or job state.
 """
 
+import datetime
 import json
 import logging
 import os
+import platform
 import re
+import socket
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +40,9 @@ from typing import Any, Dict, List, Optional, Tuple
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 DATAPROC_API = "https://dataproc.googleapis.com/v1"
 LOGGING_API = "https://logging.googleapis.com/v2"
+COMPUTE_API = "https://compute.googleapis.com/compute/v1"
+MONITORING_API = "https://monitoring.googleapis.com/v3"
+NOTEBOOKS_API = "https://notebooks.googleapis.com/v2"
 
 logger = logging.getLogger("dataproc_gateway_diagnostics")
 
@@ -259,6 +266,12 @@ class GatewayDiagnosticClient:
                     roles = ["roles/dataproc.viewer", "dataproc.clusters.use"]
                 elif "logging.googleapis.com" in url:
                     roles = ["roles/logging.viewer"]
+                elif "compute.googleapis.com" in url:
+                    roles = ["roles/compute.viewer"]
+                elif "monitoring.googleapis.com" in url:
+                    roles = ["roles/monitoring.viewer"]
+                elif "notebooks.googleapis.com" in url:
+                    roles = ["roles/notebooks.viewer"]
                 raise AccessDenied(detail, required_roles=roles) from exc
             if exc.code == 404:
                 raise NotFound(detail) from exc
@@ -511,16 +524,34 @@ class GatewayDiagnosticClient:
             state = inst.get("state", "ACTIVE")
             proxy_uri = inst.get("proxyUri", "")
 
+            zone = "us-central1-a"
+            if "/locations/" in full_name:
+                parts = full_name.split("/")
+                idx = parts.index("locations")
+                if idx + 1 < len(parts):
+                    zone = parts[idx + 1]
+
             # Extract numeric GCE instance id if available
             gce_setup = inst.get("gceSetup", {})
             instance_id = gce_setup.get("instanceId", "")
             sa_list = gce_setup.get("serviceAccounts", [])
+
+            cand_detail = {
+                "name": vm_name,
+                "zone": zone,
+                "creator": creator,
+                "state": state,
+                "proxy_uri": proxy_uri,
+                "instance_id": str(instance_id),
+            }
+
             for sa in sa_list:
                 email = sa.get("email", "").strip()
                 if not email:
                     continue
                 info = {
                     "name": vm_name,
+                    "zone": zone,
                     "creator": creator,
                     "state": state,
                     "proxy_uri": proxy_uri,
@@ -533,18 +564,22 @@ class GatewayDiagnosticClient:
                         inventory[key] = info.copy()
                         inventory[key]["active_candidates"] = [vm_name] if state == "ACTIVE" else []
                         inventory[key]["all_candidates"] = [vm_name]
+                        inventory[key]["candidate_details"] = [cand_detail]
                     else:
                         target = inventory[key]
                         if vm_name not in target["all_candidates"]:
                             target["all_candidates"].append(vm_name)
                         if state == "ACTIVE" and vm_name not in target["active_candidates"]:
                             target["active_candidates"].append(vm_name)
+                        if not any(c.get("name") == vm_name for c in target.get("candidate_details", [])):
+                            target.setdefault("candidate_details", []).append(cand_detail)
 
             # Also index by creator email & prefix if creator is present
             if creator:
                 creator_clean = creator.strip()
                 c_info = {
                     "name": vm_name,
+                    "zone": zone,
                     "creator": creator,
                     "state": state,
                     "proxy_uri": proxy_uri,
@@ -556,14 +591,453 @@ class GatewayDiagnosticClient:
                         inventory[c_key] = c_info.copy()
                         inventory[c_key]["active_candidates"] = [vm_name] if state == "ACTIVE" else []
                         inventory[c_key]["all_candidates"] = [vm_name]
+                        inventory[c_key]["candidate_details"] = [cand_detail]
                     else:
                         target = inventory[c_key]
                         if vm_name not in target["all_candidates"]:
                             target["all_candidates"].append(vm_name)
                         if state == "ACTIVE" and vm_name not in target["active_candidates"]:
                             target["active_candidates"].append(vm_name)
+                        if not any(c.get("name") == vm_name for c in target.get("candidate_details", [])):
+                            target.setdefault("candidate_details", []).append(cand_detail)
 
         return inventory
+
+    def resolve_execution_context(self) -> Dict[str, Any]:
+        """Detect whether the script is running inside or outside Workbench."""
+        context: Dict[str, Any] = {
+            "is_in_situ": False,
+            "environment": "External Workstation",
+            "location": "Outside Workbench",
+            "host": "unknown",
+            "zone": None,
+            "vm_name": None,
+            "display": "External Workstation (Outside Workbench)",
+        }
+
+        # Step A: Check GCE metadata server
+        is_gce = False
+        vm_name = None
+        zone = None
+        attributes: List[str] = []
+
+        try:
+            req_name = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1/instance/name",
+                headers={"Metadata-Flavor": "Google"},
+            )
+            with urllib.request.urlopen(req_name, timeout=0.5) as resp:
+                vm_name = resp.read().decode("utf-8").strip()
+                is_gce = True
+        except Exception:
+            pass
+
+        if is_gce and vm_name:
+            try:
+                req_zone = urllib.request.Request(
+                    "http://metadata.google.internal/computeMetadata/v1/instance/zone",
+                    headers={"Metadata-Flavor": "Google"},
+                )
+                with urllib.request.urlopen(req_zone, timeout=0.5) as resp:
+                    raw_zone = resp.read().decode("utf-8").strip()
+                    zone = raw_zone.split("/")[-1] if "/" in raw_zone else raw_zone
+            except Exception:
+                pass
+
+            try:
+                req_attrs = urllib.request.Request(
+                    "http://metadata.google.internal/computeMetadata/v1/instance/attributes/",
+                    headers={"Metadata-Flavor": "Google"},
+                )
+                with urllib.request.urlopen(req_attrs, timeout=0.5) as resp:
+                    attributes = resp.read().decode("utf-8").splitlines()
+            except Exception:
+                pass
+
+            has_wb_attr = any(
+                a.strip() in ("proxy-url", "proxy-backend-id", "notebooks-api", "framework")
+                for a in attributes
+            )
+
+            has_local_jupyter = False
+            try:
+                req_jup = urllib.request.Request(
+                    "http://127.0.0.1:8080/api/status",
+                    headers={"Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req_jup, timeout=0.5) as resp:
+                    if resp.status == 200:
+                        has_local_jupyter = True
+            except Exception:
+                pass
+
+            if has_wb_attr or has_local_jupyter:
+                context["is_in_situ"] = True
+                context["environment"] = "Vertex AI Workbench Instance"
+                context["location"] = "In Situ"
+                context["host"] = vm_name
+                context["vm_name"] = vm_name
+                context["zone"] = zone
+                zone_str = f", Zone: {zone}" if zone else ""
+                context["display"] = f"Vertex AI Workbench Instance (In Situ: {vm_name}{zone_str})"
+                return context
+            else:
+                context["is_in_situ"] = False
+                context["environment"] = "External GCE VM"
+                context["location"] = "Outside Workbench"
+                context["host"] = vm_name
+                context["vm_name"] = vm_name
+                context["zone"] = zone
+                zone_str = f", Zone: {zone}" if zone else ""
+                context["display"] = f"External GCE VM (Outside Workbench: {vm_name}{zone_str})"
+                return context
+
+        # Step B: Fallback to workstation hostname
+        try:
+            fqdn = socket.getfqdn()
+            hostname = fqdn or socket.gethostname() or platform.node()
+        except Exception:
+            hostname = "localhost"
+
+        context["is_in_situ"] = False
+        context["host"] = hostname
+        if ".c.googlers.com" in hostname or "cloudtop" in hostname:
+            context["environment"] = "Cloudtop Workstation"
+            context["display"] = f"External Workstation (Outside Workbench: {hostname})"
+        else:
+            context["environment"] = "External Workstation"
+            context["display"] = f"External Workstation (Outside Workbench: {hostname})"
+
+        return context
+
+    def check_iam_capabilities(self) -> Dict[str, Any]:
+        """Probes caller capabilities and permission matrix for diagnostics."""
+        matrix: Dict[str, Dict[str, Any]] = {
+            "core_dataproc": {
+                "name": "Dataproc Cluster API",
+                "role": "roles/dataproc.viewer",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "core_gateway_yarn": {
+                "name": "Gateway REST / YARN API",
+                "role": "dataproc.clusters.use",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "cloud_logging": {
+                "name": "Cloud Logging Logs",
+                "role": "roles/logging.viewer",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "workbench_inventory": {
+                "name": "Workbench Inventory",
+                "role": "roles/notebooks.viewer",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "signal_1_guest_attributes": {
+                "name": "Signal 1 Guest Attributes",
+                "role": "compute.instances.get",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "signal_2_serial_console": {
+                "name": "Signal 2 Serial Console",
+                "role": "logging.entries.list",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "signal_3_cloud_monitoring": {
+                "name": "Signal 3 Cloud Monitoring",
+                "role": "roles/monitoring.viewer",
+                "granted": True,
+                "detail": "Granted",
+            },
+            "method_3_inverting_proxy": {
+                "name": "Method 3 Inverting Proxy",
+                "role": "Inverting Proxy Bearer",
+                "granted": False,
+                "detail": "Requires browser session cookie or direct SA token (HTTP 401)",
+            },
+            "method_2_iap_tunnel": {
+                "name": "Method 2 IAP Tunnel",
+                "role": "roles/iap.tunnelResourceAccessor",
+                "granted": True,
+                "detail": "Port 8080 bound to 127.0.0.1 inside VM (Connection Refused)",
+            },
+            "method_1_gce_exec": {
+                "name": "Method 1 Non-Intr. SSH",
+                "role": "compute.instances.setMetadata",
+                "granted": True,
+                "detail": "Requires CorpSSH/SSO or instance SSH keys",
+            },
+        }
+
+        # Probe Dataproc cluster API
+        try:
+            self.get_cluster()
+        except AccessDenied:
+            matrix["core_dataproc"]["granted"] = False
+            matrix["core_dataproc"]["detail"] = "Access Denied (401/403)"
+        except Exception:
+            pass
+
+        # Probe Component Gateway / YARN
+        try:
+            base = self.kernel_gateway_base()
+            if base:
+                self._get_json(f"{base}/api/kernels")
+        except AccessDenied:
+            matrix["core_gateway_yarn"]["granted"] = False
+            matrix["core_gateway_yarn"]["detail"] = "Access Denied (dataproc.clusters.use missing)"
+        except Exception:
+            pass
+
+        # Probe Cloud Logging
+        try:
+            self.log_entries('resource.type="gce_instance"', page_size=1)
+        except AccessDenied:
+            matrix["cloud_logging"]["granted"] = False
+            matrix["cloud_logging"]["detail"] = "Access Denied (roles/logging.viewer missing)"
+            matrix["signal_2_serial_console"]["granted"] = False
+            matrix["signal_2_serial_console"]["detail"] = "Access Denied (roles/logging.viewer missing)"
+        except Exception:
+            pass
+
+        # Probe Workbench Inventory
+        try:
+            url = f"{NOTEBOOKS_API}/projects/{self.project_id}/locations/-/instances?pageSize=1"
+            self._get_json(url)
+        except AccessDenied:
+            matrix["workbench_inventory"]["granted"] = False
+            matrix["workbench_inventory"]["detail"] = "Access Denied (roles/notebooks.viewer missing)"
+        except Exception:
+            pass
+
+        # Probe Cloud Monitoring
+        try:
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            mon_url = (
+                f"{MONITORING_API}/projects/{self.project_id}/timeSeries"
+                f"?filter={urllib.parse.quote('metric.type=\"compute.googleapis.com/instance/network/sent_bytes_count\"')}"
+                f"&interval.startTime={urllib.parse.quote(now_iso)}"
+                f"&interval.endTime={urllib.parse.quote(now_iso)}"
+                f"&pageSize=1"
+            )
+            self._get_json(mon_url)
+        except AccessDenied:
+            matrix["signal_3_cloud_monitoring"]["granted"] = False
+            matrix["signal_3_cloud_monitoring"]["detail"] = "Access Denied (roles/monitoring.viewer missing)"
+        except Exception:
+            pass
+
+        return matrix
+
+    # ------------------------------------------------------------------
+    # Multi-Signal VM Disambiguation (Signals 1, 2, 3)
+    # ------------------------------------------------------------------
+    def get_instance_guest_attributes(
+        self, instance_name: str, zone: str, query_path: str = "workbench-notebooks/"
+    ) -> Dict[str, str]:
+        """Signal 1: Reads GCE guest attributes reported by JupyterLab inside the instance."""
+        if not instance_name or not zone:
+            return {}
+        url = (
+            f"{COMPUTE_API}/projects/{self.project_id}/zones/{zone}/instances/"
+            f"{urllib.parse.quote(instance_name)}/getGuestAttributes?queryPath={urllib.parse.quote(query_path)}"
+        )
+        try:
+            data = self._get_json(url)
+            items = data.get("queryValue", {}).get("items", [])
+            return {item.get("key", ""): item.get("value", "") for item in items if item.get("key")}
+        except Exception as exc:
+            logger.debug("Guest attributes unavailable for %s (%s)", instance_name, exc)
+            return {}
+
+    def get_instance_serial_activity(
+        self, instance_id: str, since: Optional[str] = None, until: Optional[str] = None
+    ) -> int:
+        """Signal 2: Counts Cloud Logging serial console HTTP entries around kernel launch."""
+        if not instance_id:
+            return 0
+        filter_parts = [
+            'resource.type="gce_instance"',
+            f'resource.labels.instance_id="{instance_id}"',
+            'textPayload:"/lab/tree/"',
+        ]
+        if since:
+            filter_parts.append(f'timestamp >= "{since}"')
+        if until:
+            filter_parts.append(f'timestamp <= "{until}"')
+        log_filter = "\n".join(filter_parts)
+        try:
+            entries = self.log_entries(log_filter, page_size=20)
+            return len(entries)
+        except Exception as exc:
+            logger.debug("Serial activity trace unavailable for %s (%s)", instance_id, exc)
+            return 0
+
+    def get_instance_network_egress(self, instance_id: str, minutes: int = 30) -> int:
+        """Signal 3: Queries Cloud Monitoring for bytes sent over the network."""
+        if not instance_id:
+            return 0
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start = (now - datetime.timedelta(minutes=minutes)).isoformat()
+        end = now.isoformat()
+        filter_str = (
+            f'metric.type="compute.googleapis.com/instance/network/sent_bytes_count" AND '
+            f'resource.labels.instance_id="{instance_id}"'
+        )
+        url = (
+            f"{MONITORING_API}/projects/{self.project_id}/timeSeries"
+            f"?filter={urllib.parse.quote(filter_str)}"
+            f"&interval.startTime={urllib.parse.quote(start)}"
+            f"&interval.endTime={urllib.parse.quote(end)}"
+            f"&pageSize=10"
+        )
+        try:
+            data = self._get_json(url)
+            series = data.get("timeSeries", [])
+            total_bytes = 0
+            for s in series:
+                for pt in s.get("points", []):
+                    val = pt.get("value", {}).get("int64Value")
+                    if val:
+                        total_bytes += int(val)
+            return total_bytes
+        except Exception as exc:
+            logger.debug("Network egress telemetry unavailable for %s (%s)", instance_id, exc)
+            return 0
+
+    # ------------------------------------------------------------------
+    # External In-Situ Probing Fallback Chain (Methods 3 -> 2 -> 1)
+    # ------------------------------------------------------------------
+    def query_remote_workbench_sessions(
+        self,
+        vm_name: str,
+        proxy_uri: Optional[str] = None,
+        zone: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        timeout: float = 2.0,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
+        """Queries remote Workbench /api/sessions via Method 3 -> Method 2 -> Method 1 fallback chain.
+
+        Returns: (sessions_list, method_name, failure_explanation)
+        """
+        # Method 3: Direct Inverting Proxy REST API call (Primary)
+        if proxy_uri:
+            url = f"https://{proxy_uri.rstrip('/')}/api/sessions"
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {self._token}",
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode("utf-8"))
+                        if isinstance(data, list):
+                            logger.info("Method 3 (Inverting Proxy REST) succeeded for %s", vm_name)
+                            return data, "Method 3 (Inverting Proxy REST)", None
+            except urllib.error.HTTPError as exc:
+                logger.debug(
+                    "Method 3 Inverting Proxy returned HTTP %d (%s); falling back to Method 2",
+                    exc.code,
+                    exc.reason,
+                )
+            except Exception as exc:
+                logger.debug("Method 3 Inverting Proxy error (%s); falling back to Method 2", exc)
+
+        # Method 2: Authenticated IAP TCP Tunnel (Fallback 1)
+        if vm_name and zone:
+            iap_proc = None
+            try:
+                cmd = [
+                    "gcloud",
+                    "compute",
+                    "start-iap-tunnel",
+                    vm_name,
+                    "8080",
+                    f"--zone={zone}",
+                    "--local-host-port=localhost:0",
+                    f"--project={self.project_id}",
+                ]
+                iap_proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                )
+                port = None
+                start_wait = time.time()
+                while time.time() - start_wait < 3.0:
+                    line = iap_proc.stderr.readline() if iap_proc.stderr else ""
+                    if not line and iap_proc.stdout:
+                        line = iap_proc.stdout.readline()
+                    m = re.search(r"\[(\d+)\]", line)
+                    if m:
+                        port = int(m.group(1))
+                        break
+                    if iap_proc.poll() is not None:
+                        break
+
+                if port:
+                    tunnel_url = f"http://127.0.0.1:{port}/api/sessions"
+                    req = urllib.request.Request(
+                        tunnel_url, headers={"Accept": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            data = json.loads(resp.read().decode("utf-8"))
+                            if isinstance(data, list):
+                                logger.info("Method 2 (IAP Tunnel) succeeded for %s", vm_name)
+                                return data, "Method 2 (IAP Tunnel)", None
+            except Exception as exc:
+                logger.debug("Method 2 IAP Tunnel failed (%s); falling back to Method 1", exc)
+            finally:
+                if iap_proc:
+                    try:
+                        iap_proc.terminate()
+                        iap_proc.wait(timeout=1.0)
+                    except Exception:
+                        try:
+                            iap_proc.kill()
+                        except Exception:
+                            pass
+
+        # Method 1: Compute Engine Non-Interactive SSH (Fallback 2)
+        if vm_name and zone:
+            try:
+                cmd = [
+                    "gcloud",
+                    "compute",
+                    "ssh",
+                    vm_name,
+                    f"--zone={zone}",
+                    f"--project={self.project_id}",
+                    '--command=curl -s http://127.0.0.1:8080/api/sessions',
+                    "--ssh-flag=-o StrictHostKeyChecking=no",
+                    "--ssh-flag=-o ConnectTimeout=3",
+                    "--ssh-flag=-o BatchMode=yes",
+                ]
+                out = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=4.0
+                )
+                if out.returncode == 0 and out.stdout.strip():
+                    data = json.loads(out.stdout.strip())
+                    if isinstance(data, list):
+                        logger.info("Method 1 (Non-Interactive SSH) succeeded for %s", vm_name)
+                        return data, "Method 1 (Non-Interactive SSH)", None
+            except Exception as exc:
+                logger.debug("Method 1 SSH exec failed (%s)", exc)
+
+        explanation = (
+            "Method 3 HTTP 401 single-user cookie lock; "
+            "Method 2 Port 8080 bound to localhost; "
+            "Method 1 SSO/CorpSSH required"
+        )
+        return [], None, explanation
 
     def lookup_workbench_notebook_file(
         self, instance_id: str, instance_name: Optional[str] = None

@@ -237,8 +237,9 @@ def check_kernel_sessions(
     if not in_situ_wb.get("is_workbench") and hasattr(client, "workbench_instances"):
         wb_inventory = client.workbench_instances()
 
-    # Cache for looked-up notebook files to avoid duplicate Cloud Logging queries
+    # Cache for looked-up notebook files and remote sessions to avoid duplicate queries
     looked_up_notebooks: Dict[str, Optional[str]] = {}
+    probed_remote_sessions: Dict[str, Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]] = {}
 
     # Build active kernel IDs and kernels_detail
     active_kernel_ids = {k.get("id", "") for k in kernels if k.get("id")}
@@ -294,14 +295,98 @@ def check_kernel_sessions(
             yarn_user = assoc_app.get("user", "")
             wb_inst = wb_inventory.get(yarn_user) or wb_inventory.get(yarn_user.lower())
             if wb_inst:
-                wb_vm = wb_inst.get("name")
-                wb_state = wb_inst.get("state")
-                wb_owner = wb_inst.get("creator")
-                inst_id = wb_inst.get("instance_id")
-                active_cands = [c for c in wb_inst.get("active_candidates", []) if c != wb_vm]
-                if active_cands:
-                    wb_candidates = active_cands
-                if inst_id:
+                cand_details = wb_inst.get("candidate_details", [])
+                primary_cand = wb_inst
+                confidence_str = ""
+
+                # If multiple candidates exist for this identity, disambiguate with Signals 1, 2, 3
+                if len(cand_details) > 1:
+                    scored_candidates = []
+                    for cand in cand_details:
+                        c_name = cand.get("name", "")
+                        c_zone = cand.get("zone", "")
+                        c_id = cand.get("instance_id", "")
+                        c_state = cand.get("state", "ACTIVE")
+
+                        score = 0
+                        signals_triggered = []
+
+                        # Base score: state ACTIVE > STOPPED
+                        if c_state == "ACTIVE":
+                            score += 40
+
+                        # Signal 1: GCE Guest Attributes last_activity
+                        if c_name and c_zone and hasattr(client, "get_instance_guest_attributes"):
+                            attrs = client.get_instance_guest_attributes(c_name, c_zone)
+                            vm_last = attrs.get("last_activity")
+                            if vm_last:
+                                vm_dt = parse_timestamp(vm_last)
+                                if vm_dt:
+                                    delta = abs((now - vm_dt).total_seconds())
+                                    if delta < 86400:  # active in last 24h
+                                        score += 30
+                                        signals_triggered.append("Signal 1 Guest Attributes")
+
+                        # Signal 2: Cloud Logging Serial Activity around kernel start
+                        if c_id and hasattr(client, "get_instance_serial_activity"):
+                            serial_hits = client.get_instance_serial_activity(c_id)
+                            if serial_hits > 0:
+                                score += 20
+                                signals_triggered.append("Signal 2 Serial Trace")
+
+                        # Signal 3: Cloud Monitoring VM Network Egress
+                        if c_id and hasattr(client, "get_instance_network_egress"):
+                            egress_bytes = client.get_instance_network_egress(c_id, minutes=30)
+                            if egress_bytes > 5000:
+                                score += 10
+                                signals_triggered.append("Signal 3 Cloud Monitoring")
+
+                        scored_candidates.append((score, signals_triggered, cand))
+
+                    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+                    best_score, best_signals, best_cand = scored_candidates[0]
+                    primary_cand = best_cand
+                    if best_signals:
+                        confidence_str = f" ({best_score}% confidence via {', '.join(best_signals)})"
+
+                wb_vm = primary_cand.get("name")
+                wb_state = primary_cand.get("state")
+                wb_owner = primary_cand.get("creator")
+                inst_id = primary_cand.get("instance_id")
+                proxy_uri = primary_cand.get("proxy_uri")
+                zone = primary_cand.get("zone")
+
+                all_cands = [c.get("name") for c in cand_details if c.get("name") != wb_vm]
+                if all_cands:
+                    wb_candidates = all_cands
+
+                # Try External In-Situ Probing Fallback Chain (Method 3 -> 2 -> 1)
+                remote_sessions: List[Dict[str, Any]] = []
+                method_used: Optional[str] = None
+                remote_probe_err: Optional[str] = None
+
+                if wb_vm and hasattr(client, "query_remote_workbench_sessions"):
+                    if wb_vm not in probed_remote_sessions:
+                        probed_remote_sessions[wb_vm] = client.query_remote_workbench_sessions(
+                            wb_vm, proxy_uri=proxy_uri, zone=zone, instance_id=inst_id
+                        )
+                    remote_sessions, method_used, remote_probe_err = probed_remote_sessions[wb_vm]
+
+                if remote_sessions:
+                    # Match session by kernel ID or last_activity
+                    for sess in remote_sessions:
+                        sk = sess.get("kernel") or {}
+                        if sk.get("id") == k_id:
+                            matched_wb_id = sess.get("id")
+                            wb_notebook = sess.get("path") or sess.get("name")
+                            break
+                    if not wb_notebook and remote_sessions:
+                        # Fall back to first session
+                        matched_wb_id = remote_sessions[0].get("id")
+                        wb_notebook = remote_sessions[0].get("path") or remote_sessions[0].get("name")
+
+                # If remote probing didn't resolve the notebook file, fall back to Cloud Logging Serial Trace
+                if not wb_notebook and inst_id:
                     if inst_id not in looked_up_notebooks:
                         looked_up_notebooks[inst_id] = (
                             client.lookup_workbench_notebook_file(inst_id, wb_vm)
@@ -309,6 +394,37 @@ def check_kernel_sessions(
                             else None
                         )
                     wb_notebook = looked_up_notebooks[inst_id]
+
+        # Resolve display and explanation strings for explicit rendering policy
+        if wb_vm:
+            state_str = f" ({wb_state or 'ACTIVE'})"
+            cand_str = f" [Alternative: {', '.join(wb_candidates)}]" if wb_candidates else ""
+            wb_vm_display = f"{wb_vm}{state_str}{confidence_str}{cand_str}"
+            wb_vm_explanation = None
+        else:
+            wb_vm_display = "[Unresolved] (Missing notebooks.instances.list permission or no matching VM for identity)"
+            wb_vm_explanation = "Missing notebooks.instances.list permission or no matching VM for identity"
+
+        if wb_owner:
+            wb_owner_display = wb_owner
+            wb_owner_explanation = None
+        else:
+            wb_owner_display = "[Unresolved] (Workbench instance metadata unavailable)"
+            wb_owner_explanation = "Workbench instance metadata unavailable"
+
+        if wb_notebook:
+            wb_notebook_display = wb_notebook
+            wb_notebook_explanation = None
+        else:
+            wb_notebook_display = "[Unresolved] (No active /lab/tree/ referer found in recent GCE serial console logs)"
+            wb_notebook_explanation = "No active /lab/tree/ referer found in recent GCE serial console logs"
+
+        if matched_wb_id:
+            wb_ui_id_display = f"{matched_wb_id[:8]} ({matched_wb_id})"
+            wb_ui_id_explanation = None
+        else:
+            wb_ui_id_display = "[Unresolved] (Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec)"
+            wb_ui_id_explanation = "Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec"
 
         kernels_detail.append(
             {
@@ -320,11 +436,19 @@ def check_kernel_sessions(
                 "connections": int(kernel.get("connections", 0) or 0),
                 "associated_yarn_app": assoc_app_id,
                 "workbench_vm": wb_vm,
+                "workbench_vm_explanation": wb_vm_explanation,
                 "workbench_state": wb_state,
                 "workbench_owner": wb_owner,
-                "workbench_notebook": wb_notebook,
+                "workbench_owner_explanation": wb_owner_explanation,
+                "notebook_file": wb_notebook,
+                "notebook_file_explanation": wb_notebook_explanation,
                 "workbench_candidates": wb_candidates,
-                "workbench_kernel_id": matched_wb_id,
+                "workbench_ui_id": matched_wb_id,
+                "workbench_ui_id_explanation": wb_ui_id_explanation,
+                "workbench_vm_display": wb_vm_display,
+                "workbench_owner_display": wb_owner_display,
+                "workbench_notebook_display": wb_notebook_display,
+                "workbench_ui_id_display": wb_ui_id_display,
             }
         )
 
@@ -416,19 +540,10 @@ def check_kernel_sessions(
         for kd in kernels_detail:
             k_id_short = kd["id"][:8] if len(kd["id"]) > 8 else kd["id"]
             result.add(f"[Kernel] {k_id_short}...", kd["name"])
-            if kd.get("workbench_vm"):
-                state_str = f" ({kd['workbench_state']})" if kd.get("workbench_state") else ""
-                cands = kd.get("workbench_candidates") or []
-                cand_str = f" [Note: also active for this identity: {', '.join(cands)}]" if cands else ""
-                result.add("      * Workbench VM", f"{kd['workbench_vm']}{state_str}{cand_str}")
-            if kd.get("workbench_owner"):
-                result.add("      * Workbench Owner", kd["workbench_owner"])
-            if kd.get("workbench_notebook"):
-                result.add("      * Notebook File", kd["workbench_notebook"])
-            if kd.get("workbench_kernel_id"):
-                wb_full = kd["workbench_kernel_id"]
-                wb_short = wb_full[:8]
-                result.add("      * Workbench UI ID", f"{wb_short} ({wb_full})")
+            result.add("      * Workbench VM", kd["workbench_vm_display"])
+            result.add("      * Workbench Owner", kd["workbench_owner_display"])
+            result.add("      * Notebook File", kd["workbench_notebook_display"])
+            result.add("      * Workbench UI ID", kd["workbench_ui_id_display"])
             result.add(
                 "      * State",
                 f"{kd['execution_state']} (idle for {humanize_duration(kd['idle_seconds'])})",

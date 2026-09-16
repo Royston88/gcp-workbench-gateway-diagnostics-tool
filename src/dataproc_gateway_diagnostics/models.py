@@ -97,6 +97,8 @@ class GatewayDiagnosticReport:
     cluster_state: str = ""
     image_version: str = ""
     generated_at: str = ""
+    execution_context: Dict[str, Any] = field(default_factory=dict)
+    iam_capabilities: Dict[str, Any] = field(default_factory=dict)
     checks: List[CheckResult] = field(default_factory=list)
 
     @property
@@ -131,6 +133,8 @@ class GatewayDiagnosticReport:
             "cluster_state": self.cluster_state,
             "image_version": self.image_version,
             "active_account": self.active_account,
+            "execution_context": self.execution_context,
+            "iam_capabilities": self.iam_capabilities,
             "overall_status": self.overall_status,
             "primary_root_cause": primary.name if primary else None,
             "checks": [c.to_dict() for c in self.checks],

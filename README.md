@@ -80,7 +80,7 @@ gcloud iam roles create DataprocGatewayDiagnosticsAuditor \
     --project=<PROJECT_ID> \
     --title="Dataproc Gateway Diagnostics Auditor" \
     --description="Read-only permissions for diagnosing Jupyter Kernel Gateway, YARN, and Workbench correlation" \
-    --permissions="dataproc.clusters.get,dataproc.clusters.use,logging.entries.list,notebooks.instances.list" \
+    --permissions="dataproc.clusters.get,dataproc.clusters.use,logging.entries.list,notebooks.instances.list,compute.instances.get,monitoring.timeSeries.list" \
     --stage="GA"
 ```
 
@@ -235,78 +235,93 @@ Exit code `1`. Reading it line by line:
 ## Expected output — Case C: Zombie / idle kernels & orphaned YARN apps
 
 ```
+=================================================================
+           JUPYTER KERNEL GATEWAY & YARN CAPACITY AUDIT
+=================================================================
+Tool Version      : 0.2.0
+Generated At      : 2026-09-16 05:22:07 UTC
+Project ID        : kenly-lakehouse-dev-1
+Region ID         : us-central1
+Target Cluster    : pyspark-cluster-e2e-20260915-v5
+Cluster State     : RUNNING
+Image Version     : 2.3.36-debian12
+Active Account    : admin@kenly.altostrat.com
+Execution Context : External GCE VM (Outside Workbench: kenly, Zone: asia-southeast1-b)
+-----------------------------------------------------------------
+[PRE-FLIGHT] IAM Permissions & Diagnostic Capabilities
+   -> Core Diagnostic Checks     : [✓] FULL (Checks 1, 2, 3, 4 ready)
+      * Dataproc Cluster API     : GRANTED (roles/dataproc.viewer)
+      * Gateway REST / YARN API  : GRANTED (dataproc.clusters.use)
+      * Cloud Logging Logs       : GRANTED (roles/logging.viewer)
+   -> Multi-VM Disambiguation    : [✓] ENABLED (Signals 1, 2, 3 active)
+      * Signal 1 Guest Attributes: GRANTED (compute.instances.get)
+      * Signal 2 Serial Console  : GRANTED (logging.entries.list)
+      * Signal 3 Cloud Monitoring: GRANTED (roles/monitoring.viewer)
+   -> External In-Situ Probing   : [✓] AVAILABLE (Fallback Chain: 3 -> 2 -> 1 -> Cloud Logging)
+      * Method 3 Inverting Proxy : SKIPPED (Requires browser session cookie or direct SA token (HTTP 401))
+      * Method 2 IAP Tunnel      : DEGRADED (Port 8080 bound to 127.0.0.1 inside VM (Connection Refused))
+      * Method 1 Non-Intr. SSH   : BLOCKED (Requires CorpSSH/SSO or instance SSH keys)
+      * Safety Net Serial Trace  : ACTIVE (Cloud Logging /lab/tree/ referer)
+-----------------------------------------------------------------
+
 [CHECK 1] Zombie / Idle Kernel Sessions
    -> Active kernels                : 1
    -> Busy (executing)              : 0
-   -> Idle > 2h                     : 1
-   -> Longest idle                  : 12d 11h 59m
-   -> Running YARN applications     : 2 (older than 24h: 2)
+   -> Idle > 2h                     : 0
+   -> Longest idle                  : 1h 36m
+   -> Running YARN applications     : 1 (older than 24h: 0)
 
    --- Configuration Status ---
-   -> YARN Application Lifetime     : UNLIMITED (no automatic reaper)
+   -> YARN Application Lifetime     : 86400s (1d 0h 0m max lifetime)
 
    --- Active Kernel Gateway Sessions ---
 
-   -> [Kernel] 64fa53be...          : pyspark_yarn
-      * Workbench VM                : instance-20260901-162000-single-svc (ACTIVE)
+   -> [Kernel] 05a855ac...          : pyspark_yarn
+      * Workbench VM                : instance-20260901-162000-single-svc (ACTIVE) (100% confidence via Signal 1 Guest Attributes, Signal 2 Serial Trace, Signal 3 Cloud Monitoring) [Alternative: instance-20251203-071523-single-svc, instance-20251120-225315-single-svc]
       * Workbench Owner             : ds_user_1@kenly.altostrat.com
-      * Notebook File               : churn_analysis.ipynb
-      * Workbench UI ID             : 64fa53be (64fa53be-9cd7-4886-b382-08aac85d4eb2)
-      * State                       : idle (idle for 12d 11h 59m)
-      * Active Connections          : 4 connected WebSocket client(s)
-      * Associated YARN App         : application_1779383468488_0011
+      * Notebook File               : Dataproc_Gateway_Diagnostics.ipynb
+      * Workbench UI ID             : [Unresolved] (Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec)
+      * State                       : idle (idle for 1h 36m)
+      * Active Connections          : 0 connected WebSocket client(s)
+      * Associated YARN App         : application_1789471462247_0006
 
    --- Running YARN Applications ---
 
-   -> [Active Gateway Session] application_1779383468488_0011
-      * Name                        : 64fa53be-9cd7-4886-b382-08aac85d4eb2
+   -> [Active Gateway Session] application_1789471462247_0006
+      * Name                        : 05a855ac-68d2-43df-9013-38a819b085a7
       * User                        : ds-user-1-svc
-      * Started                     : 2026-09-01 10:18:53 UTC (13d 3h 20m ago)
-      * Allocation                  : 4.8 GB, 3 vCores, 2 container(s)
-      * Host Node                   : pyspark-cluster...-w-1:8044
-
-   -> [ORPHANED YARN APP] application_1779383468488_0005
-      * Name                        : 67913c09-b89b-4f8b-9d48-e44954a67643
-      * User                        : ds-user-1-svc
-      * Started                     : 2026-09-01 09:31:27 UTC (13d 4h 8m ago)
+      * Started                     : 2026-09-16 01:31:18 UTC (3h 50m ago)
       * Allocation                  : 4.8 GB, 3 vCores, 2 container(s)
       * Host Node                   : pyspark-cluster...-w-0:8044
-      * Status                      : No active gateway session; driver still alive
-   -> Verdict                       : [✗] FAIL
-      1 idle kernel(s) and 2 long-running YARN application(s)
-      (including 1 orphaned app) are holding ApplicationMaster
-      capacity.
+   -> Verdict                       : [✓] PASS
+      1 active kernel(s), none idle beyond threshold.
 
 =================================================================
-   Check 1  Zombie / Idle Kernel Sessions    : [✗] FAIL   <-- PRIMARY ROOT CAUSE
+                             SUMMARY
+=================================================================
+   Check 1  Zombie / Idle Kernel Sessions    : [✓] PASS
    Check 2  YARN ApplicationMaster Capacity  : [✓] PASS
-   OVERALL                                   : [✗] FAIL
+   Check 3  Kernel Gateway Launch Timeouts   : [✓] PASS
+   Check 4  Spark Driver / AM Sizing         : [✓] PASS
+   OVERALL                                   : [✓] PASS
 =================================================================
-              RECOMMENDED REMEDIATION (priority order)
-=================================================================
-   1. Configure YARN Application Lifetime Reaper
-      (yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true,
-      yarn:yarn.resourcemanager.app.max-lifetime=86400) to
-      automatically terminate abandoned sessions.
-   2. Kill 1 orphaned YARN application(s): yarn application
-      -kill <APP_ID> or via YARN ResourceManager Web UI.
-   3. Shut down abandoned kernels via JupyterLab: 'Running
-      Terminals and Kernels' tab, or Kernel > Shut Down All Kernels.
+                       No action required.
 =================================================================
 ```
 
-Exit code `1`. Reading it line by line:
+Reading it line by line:
 
 | Line | Why it matters |
 |---|---|
-| `* Workbench VM` | Identifies the Vertex AI Workbench Compute Engine instance that initiated the session (resolved via local metadata or external control plane API). |
+| `Execution Context` | Automatically distinguishes whether the tool is running *in-situ* inside a Workbench VM or *outside* on a Cloudtop/workstation. |
+| `[PRE-FLIGHT] IAM Permissions` | Upfront capability audit indicating caller permissions and active diagnostic signals/methods. |
+| `* Workbench VM` | Identifies the Vertex AI Workbench Compute Engine instance that initiated the session. When multiple VMs share the SA, disambiguates via Signals 1, 2, and 3. |
 | `* Workbench Owner` | Identifies the human creator / owner of the notebook instance (`creator` or `proxy-user-mail`). |
-| `* Notebook File` | Discovered active `.ipynb` notebook file path (via in-situ JupyterLab `/api/sessions` or external Cloud Logging serial console referer trace). |
-| `* Workbench UI ID` | The local session UUID shown in JupyterLab's *Running Terminals and Kernels* left sidebar (populated when executing inside the Workbench VM). |
-| `YARN Application Lifetime : UNLIMITED` | YARN has no lifetime monitor active to reap long-abandoned interactive drivers. (When configured: shows duration e.g. `86400s (1d 0h 0m max lifetime)`). |
+| `* Notebook File` | Discovered active `.ipynb` notebook file path (via remote probing or Cloud Logging serial console referer trace). |
+| `* Workbench UI ID` | The local session UUID shown in JupyterLab's *Running Terminals and Kernels* left sidebar (populated when executing inside the Workbench VM or via remote probe). Explicitly marked `[Unresolved]` when blocked. |
+| `YARN Application Lifetime : 86400s` | YARN lifetime monitor active to reap long-abandoned interactive drivers after 24 hours. |
 | `[Active Gateway Session]` | PySpark session initiated from Workbench, currently idle with WebSocket connections holding the AM slot. |
 | `[ORPHANED YARN APP]` | A Spark driver running on YARN with **no active kernel** on the gateway. Left behind after a gateway crash or ungraceful shutdown. |
-| `Kill orphaned YARN application` | Orphaned apps cannot be culled through Jupyter; they must be terminated via `yarn application -kill <APP_ID>`. |
 
 ---
 

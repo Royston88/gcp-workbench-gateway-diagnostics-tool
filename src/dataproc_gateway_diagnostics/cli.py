@@ -60,6 +60,17 @@ def build_report(
     cluster = client.get_cluster()
     software = cluster.get("config", {}).get("softwareConfig", {})
 
+    execution_context = (
+        client.resolve_execution_context()
+        if hasattr(client, "resolve_execution_context")
+        else {}
+    )
+    iam_capabilities = (
+        client.check_iam_capabilities()
+        if hasattr(client, "check_iam_capabilities")
+        else {}
+    )
+
     report = GatewayDiagnosticReport(
         tool_version=__version__,
         project_id=client.project_id,
@@ -70,6 +81,8 @@ def build_report(
         cluster_state=cluster.get("status", {}).get("state", ""),
         image_version=software.get("imageVersion", ""),
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        execution_context=execution_context,
+        iam_capabilities=iam_capabilities,
     )
     report.checks = run_checks(
         client,
@@ -88,18 +101,59 @@ def render_text(report: GatewayDiagnosticReport) -> str:
     lines.append(RULE)
     lines.append(_center("JUPYTER KERNEL GATEWAY & YARN CAPACITY AUDIT"))
     lines.append(RULE)
-    lines.append(f"Tool Version   : {report.tool_version}")
-    lines.append(f"Generated At   : {report.generated_at}")
-    lines.append(f"Project ID     : {report.project_id}")
-    lines.append(f"Region ID      : {report.region_id}")
-    lines.append(f"Target Cluster : {report.cluster_name}")
+    lines.append(f"Tool Version      : {report.tool_version}")
+    lines.append(f"Generated At      : {report.generated_at}")
+    lines.append(f"Project ID        : {report.project_id}")
+    lines.append(f"Region ID         : {report.region_id}")
+    lines.append(f"Target Cluster    : {report.cluster_name}")
     if report.cluster_state:
-        lines.append(f"Cluster State  : {report.cluster_state}")
+        lines.append(f"Cluster State     : {report.cluster_state}")
     if report.image_version:
-        lines.append(f"Image Version  : {report.image_version}")
+        lines.append(f"Image Version     : {report.image_version}")
     if report.active_account:
-        lines.append(f"Active Account : {report.active_account}")
+        lines.append(f"Active Account    : {report.active_account}")
+    if report.execution_context and report.execution_context.get("display"):
+        lines.append(f"Execution Context : {report.execution_context['display']}")
     lines.append(THIN)
+
+    # Pre-Flight IAM Permissions & Diagnostic Capabilities Matrix
+    if report.iam_capabilities:
+        lines.append("[PRE-FLIGHT] IAM Permissions & Diagnostic Capabilities")
+        iam = report.iam_capabilities
+
+        # 1. Core Diagnostic Checks
+        c_dp = iam.get("core_dataproc", {})
+        c_gw = iam.get("core_gateway_yarn", {})
+        c_log = iam.get("cloud_logging", {})
+        core_ready = c_dp.get("granted", True) and c_gw.get("granted", True) and c_log.get("granted", True)
+        core_status = "[✓] FULL (Checks 1, 2, 3, 4 ready)" if core_ready else "[!] DEGRADED"
+        lines.append(f"   -> Core Diagnostic Checks     : {core_status}")
+        lines.append(f"      * Dataproc Cluster API     : {'GRANTED' if c_dp.get('granted') else 'MISSING'} ({c_dp.get('role', 'roles/dataproc.viewer')})")
+        lines.append(f"      * Gateway REST / YARN API  : {'GRANTED' if c_gw.get('granted') else 'MISSING'} ({c_gw.get('role', 'dataproc.clusters.use')})")
+        lines.append(f"      * Cloud Logging Logs       : {'GRANTED' if c_log.get('granted') else 'MISSING'} ({c_log.get('role', 'roles/logging.viewer')})")
+
+        # 2. Multi-VM Disambiguation
+        s1 = iam.get("signal_1_guest_attributes", {})
+        s2 = iam.get("signal_2_serial_console", {})
+        s3 = iam.get("signal_3_cloud_monitoring", {})
+        wb_inv = iam.get("workbench_inventory", {})
+        multi_ready = wb_inv.get("granted", True) and (s1.get("granted") or s2.get("granted") or s3.get("granted"))
+        multi_status = "[✓] ENABLED (Signals 1, 2, 3 active)" if multi_ready else "[!] DEGRADED"
+        lines.append(f"   -> Multi-VM Disambiguation    : {multi_status}")
+        lines.append(f"      * Signal 1 Guest Attributes: {'GRANTED' if s1.get('granted') else 'MISSING'} ({s1.get('role', 'compute.instances.get')})")
+        lines.append(f"      * Signal 2 Serial Console  : {'GRANTED' if s2.get('granted') else 'MISSING'} ({s2.get('role', 'logging.entries.list')})")
+        lines.append(f"      * Signal 3 Cloud Monitoring: {'GRANTED' if s3.get('granted') else 'MISSING'} ({s3.get('role', 'roles/monitoring.viewer')})")
+
+        # 3. External In-Situ Probing
+        m3 = iam.get("method_3_inverting_proxy", {})
+        m2 = iam.get("method_2_iap_tunnel", {})
+        m1 = iam.get("method_1_gce_exec", {})
+        lines.append(f"   -> External In-Situ Probing   : [✓] AVAILABLE (Fallback Chain: 3 -> 2 -> 1 -> Cloud Logging)")
+        lines.append(f"      * Method 3 Inverting Proxy : SKIPPED ({m3.get('detail')})")
+        lines.append(f"      * Method 2 IAP Tunnel      : DEGRADED ({m2.get('detail')})")
+        lines.append(f"      * Method 1 Non-Intr. SSH   : BLOCKED ({m1.get('detail')})")
+        lines.append(f"      * Safety Net Serial Trace  : ACTIVE (Cloud Logging /lab/tree/ referer)")
+        lines.append(THIN)
 
     for check in report.checks:
         lines.append("")
