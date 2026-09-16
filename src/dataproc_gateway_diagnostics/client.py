@@ -31,7 +31,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 DATAPROC_API = "https://dataproc.googleapis.com/v1"
@@ -396,15 +396,27 @@ class GatewayDiagnosticClient:
                         k = sess.get("kernel") or {}
                         k_id = k.get("id")
                         last_act = k.get("last_activity")
+                        path = sess.get("path") or sess.get("name") or "unknown"
+                        sess_id = sess.get("id")
                         info = {
-                            "session_id": sess.get("id"),
-                            "notebook_path": sess.get("path") or sess.get("name"),
+                            "session_id": sess_id,
+                            "notebook_path": path,
                             "notebook_name": sess.get("name"),
                             "kernel_id": k_id,
                             "last_activity": last_act,
                         }
                         if k_id:
-                            result["sessions_by_kernel_id"][k_id] = info
+                            if k_id not in result["sessions_by_kernel_id"]:
+                                result["sessions_by_kernel_id"][k_id] = info
+                                result["sessions_by_kernel_id"][k_id]["all_paths"] = [path]
+                                result["sessions_by_kernel_id"][k_id]["all_sessions"] = [sess_id]
+                            else:
+                                existing = result["sessions_by_kernel_id"][k_id]
+                                if path not in existing["all_paths"]:
+                                    existing["all_paths"].append(path)
+                                    existing["notebook_path"] = ", ".join(existing["all_paths"])
+                                if sess_id not in existing["all_sessions"]:
+                                    existing["all_sessions"].append(sess_id)
                         if last_act:
                             result["sessions_by_last_activity"][last_act] = info
         except Exception:
@@ -469,7 +481,7 @@ class GatewayDiagnosticClient:
         """Queries Vertex AI Workbench v2 API for instance inventory in the project.
 
         Returns a dictionary indexed by Service Account email and SA username prefix:
-          sa_key -> {"name": instance_name, "creator": creator, "instance_id": id, "state": state}
+          sa_key -> {"name": instance_name, "creator": creator, "instance_id": id, "state": state, ...}
         """
         url = f"https://notebooks.googleapis.com/v2/projects/{self.project_id}/locations/-/instances"
         try:
@@ -484,7 +496,15 @@ class GatewayDiagnosticClient:
         instances = data.get("instances", []) if isinstance(data, dict) else []
         inventory: Dict[str, Dict[str, Any]] = {}
 
-        for inst in instances:
+        # Prioritize ACTIVE instances over STOPPED ones, and sort by latest update/create time
+        def _sort_key(inst: Dict[str, Any]) -> Tuple[int, str]:
+            is_active = 1 if inst.get("state") == "ACTIVE" else 0
+            update_time = inst.get("updateTime") or inst.get("createTime") or ""
+            return (is_active, update_time)
+
+        sorted_instances = sorted(instances, key=_sort_key, reverse=True)
+
+        for inst in sorted_instances:
             full_name = inst.get("name", "")
             vm_name = full_name.split("/")[-1] if full_name else "unknown"
             creator = inst.get("creator", "")
@@ -507,13 +527,18 @@ class GatewayDiagnosticClient:
                     "instance_id": str(instance_id),
                     "sa_email": email,
                 }
-                # Index by full SA email
-                inventory[email] = info
-                inventory[email.lower()] = info
-                # Index by SA prefix before @ (e.g. ds-user-1-svc)
-                prefix = email.split("@")[0]
-                inventory[prefix] = info
-                inventory[prefix.lower()] = info
+                # Register under email & prefix with multi-instance awareness
+                for key in (email, email.lower(), email.split("@")[0], email.split("@")[0].lower()):
+                    if key not in inventory:
+                        inventory[key] = info.copy()
+                        inventory[key]["active_candidates"] = [vm_name] if state == "ACTIVE" else []
+                        inventory[key]["all_candidates"] = [vm_name]
+                    else:
+                        target = inventory[key]
+                        if vm_name not in target["all_candidates"]:
+                            target["all_candidates"].append(vm_name)
+                        if state == "ACTIVE" and vm_name not in target["active_candidates"]:
+                            target["active_candidates"].append(vm_name)
 
             # Also index by creator email & prefix if creator is present
             if creator:
@@ -526,11 +551,17 @@ class GatewayDiagnosticClient:
                     "instance_id": str(instance_id),
                     "sa_email": sa_list[0].get("email", "") if sa_list else "",
                 }
-                inventory[creator_clean] = c_info
-                inventory[creator_clean.lower()] = c_info
-                c_prefix = creator_clean.split("@")[0]
-                inventory[c_prefix] = c_info
-                inventory[c_prefix.lower()] = c_info
+                for c_key in (creator_clean, creator_clean.lower(), creator_clean.split("@")[0], creator_clean.split("@")[0].lower()):
+                    if c_key not in inventory:
+                        inventory[c_key] = c_info.copy()
+                        inventory[c_key]["active_candidates"] = [vm_name] if state == "ACTIVE" else []
+                        inventory[c_key]["all_candidates"] = [vm_name]
+                    else:
+                        target = inventory[c_key]
+                        if vm_name not in target["all_candidates"]:
+                            target["all_candidates"].append(vm_name)
+                        if state == "ACTIVE" and vm_name not in target["active_candidates"]:
+                            target["active_candidates"].append(vm_name)
 
         return inventory
 
@@ -548,21 +579,27 @@ class GatewayDiagnosticClient:
 
         log_filter = "\n".join(filter_parts)
         try:
-            entries = self.log_entries(log_filter, page_size=20)
+            entries = self.log_entries(log_filter, page_size=50)
         except Exception as exc:
             logger.debug("Cloud Logging serial trace unavailable (%s)", exc)
             return None
 
+        recent_files: List[str] = []
         for entry in entries:
             text = entry.get("textPayload") or ""
             match = re.search(r"/lab/tree/([^ \r\n\t?&\\\"']+)", text)
             if match:
                 raw_path = match.group(1).strip().rstrip("\r\n\\\"'")
                 notebook_file = urllib.parse.unquote(raw_path)
-                if notebook_file:
-                    return notebook_file
+                if notebook_file and notebook_file not in recent_files:
+                    recent_files.append(notebook_file)
 
-        return None
+        if not recent_files:
+            return None
+        if len(recent_files) == 1:
+            return recent_files[0]
+        # Multiple active notebook files seen in recent logs
+        return f"{recent_files[0]} (most recent of {len(recent_files)} active: {', '.join(recent_files[:3])})"
 
     # ------------------------------------------------------------------
     # Cloud Logging

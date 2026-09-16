@@ -272,6 +272,7 @@ def check_kernel_sessions(
         wb_state: Optional[str] = None
         wb_owner: Optional[str] = None
         wb_notebook: Optional[str] = None
+        wb_candidates: List[str] = []
         matched_wb_id: Optional[str] = None
 
         last_str = kernel.get("last_activity", "")
@@ -297,6 +298,9 @@ def check_kernel_sessions(
                 wb_state = wb_inst.get("state")
                 wb_owner = wb_inst.get("creator")
                 inst_id = wb_inst.get("instance_id")
+                active_cands = [c for c in wb_inst.get("active_candidates", []) if c != wb_vm]
+                if active_cands:
+                    wb_candidates = active_cands
                 if inst_id:
                     if inst_id not in looked_up_notebooks:
                         looked_up_notebooks[inst_id] = (
@@ -319,6 +323,7 @@ def check_kernel_sessions(
                 "workbench_state": wb_state,
                 "workbench_owner": wb_owner,
                 "workbench_notebook": wb_notebook,
+                "workbench_candidates": wb_candidates,
                 "workbench_kernel_id": matched_wb_id,
             }
         )
@@ -413,7 +418,9 @@ def check_kernel_sessions(
             result.add(f"[Kernel] {k_id_short}...", kd["name"])
             if kd.get("workbench_vm"):
                 state_str = f" ({kd['workbench_state']})" if kd.get("workbench_state") else ""
-                result.add("      * Workbench VM", f"{kd['workbench_vm']}{state_str}")
+                cands = kd.get("workbench_candidates") or []
+                cand_str = f" [Note: also active for this identity: {', '.join(cands)}]" if cands else ""
+                result.add("      * Workbench VM", f"{kd['workbench_vm']}{state_str}{cand_str}")
             if kd.get("workbench_owner"):
                 result.add("      * Workbench Owner", kd["workbench_owner"])
             if kd.get("workbench_notebook"):
