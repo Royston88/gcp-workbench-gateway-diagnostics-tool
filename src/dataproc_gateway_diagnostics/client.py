@@ -104,6 +104,11 @@ def resolve_access_token() -> str:
     except Exception as exc:  # noqa: BLE001 - deliberate broad fallback
         logger.info("ADC unavailable (%s); falling back to gcloud.", exc)
 
+    token = _run(["gcloud", "auth", "application-default", "print-access-token"])
+    if token:
+        logger.info("Using token from gcloud auth application-default.")
+        return token
+
     token = _run(["gcloud", "auth", "print-access-token"])
     if token:
         logger.info("Using token from gcloud.")
@@ -531,15 +536,18 @@ class GatewayDiagnosticClient:
                 if idx + 1 < len(parts):
                     zone = parts[idx + 1]
 
-            # Extract numeric GCE instance id if available
+            # Extract numeric GCE instance id and metadata if available
             gce_setup = inst.get("gceSetup", {})
             instance_id = gce_setup.get("instanceId", "")
             sa_list = gce_setup.get("serviceAccounts", [])
+            inst_metadata = gce_setup.get("metadata", {})
+            proxy_user = inst_metadata.get("proxy-user-mail", "").strip()
+            owner = proxy_user or creator
 
             cand_detail = {
                 "name": vm_name,
                 "zone": zone,
-                "creator": creator,
+                "creator": owner,
                 "state": state,
                 "proxy_uri": proxy_uri,
                 "instance_id": str(instance_id),
@@ -552,7 +560,7 @@ class GatewayDiagnosticClient:
                 info = {
                     "name": vm_name,
                     "zone": zone,
-                    "creator": creator,
+                    "creator": owner,
                     "state": state,
                     "proxy_uri": proxy_uri,
                     "instance_id": str(instance_id),
@@ -574,19 +582,19 @@ class GatewayDiagnosticClient:
                         if not any(c.get("name") == vm_name for c in target.get("candidate_details", [])):
                             target.setdefault("candidate_details", []).append(cand_detail)
 
-            # Also index by creator email & prefix if creator is present
-            if creator:
-                creator_clean = creator.strip()
+            # Also index by owner and creator email & prefix
+            for user_id in filter(None, [owner, creator]):
+                u_clean = user_id.strip()
                 c_info = {
                     "name": vm_name,
                     "zone": zone,
-                    "creator": creator,
+                    "creator": owner,
                     "state": state,
                     "proxy_uri": proxy_uri,
                     "instance_id": str(instance_id),
                     "sa_email": sa_list[0].get("email", "") if sa_list else "",
                 }
-                for c_key in (creator_clean, creator_clean.lower(), creator_clean.split("@")[0], creator_clean.split("@")[0].lower()):
+                for c_key in (u_clean, u_clean.lower(), u_clean.split("@")[0], u_clean.split("@")[0].lower()):
                     if c_key not in inventory:
                         inventory[c_key] = c_info.copy()
                         inventory[c_key]["active_candidates"] = [vm_name] if state == "ACTIVE" else []
@@ -819,9 +827,10 @@ class GatewayDiagnosticClient:
         # Probe Cloud Monitoring
         try:
             now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            metric_filter = urllib.parse.quote('metric.type="compute.googleapis.com/instance/network/sent_bytes_count"')
             mon_url = (
                 f"{MONITORING_API}/projects/{self.project_id}/timeSeries"
-                f"?filter={urllib.parse.quote('metric.type=\"compute.googleapis.com/instance/network/sent_bytes_count\"')}"
+                f"?filter={metric_filter}"
                 f"&interval.startTime={urllib.parse.quote(now_iso)}"
                 f"&interval.endTime={urllib.parse.quote(now_iso)}"
                 f"&pageSize=1"

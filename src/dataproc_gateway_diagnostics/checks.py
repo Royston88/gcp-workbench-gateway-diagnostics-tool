@@ -275,6 +275,7 @@ def check_kernel_sessions(
         wb_notebook: Optional[str] = None
         wb_candidates: List[str] = []
         matched_wb_id: Optional[str] = None
+        confidence_str: str = ""
 
         last_str = kernel.get("last_activity", "")
 
