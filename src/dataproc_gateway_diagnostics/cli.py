@@ -151,7 +151,7 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         lines.append(f"   -> External In-Situ Probing   : [✓] AVAILABLE (Fallback Chain: 3 -> 2 -> 1 -> Cloud Logging)")
         lines.append(f"      * Method 3 Inverting Proxy : SKIPPED ({m3.get('detail')})")
         lines.append(f"      * Method 2 IAP Tunnel      : DEGRADED ({m2.get('detail')})")
-        lines.append(f"      * Method 1 Non-Intr. SSH   : BLOCKED ({m1.get('detail')})")
+        lines.append(f"      * Method 1 Non-Intr. SSH   : READY ({m1.get('detail')})")
         lines.append(f"      * Safety Net Serial Trace  : ACTIVE (Cloud Logging /lab/tree/ referer)")
         lines.append(THIN)
 

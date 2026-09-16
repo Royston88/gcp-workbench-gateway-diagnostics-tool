@@ -358,7 +358,7 @@ def check_kernel_sessions(
                 zone = primary_cand.get("zone")
 
                 all_cands = [c.get("name") for c in cand_details if c.get("name") != wb_vm]
-                if all_cands:
+                if all_cands and best_score < 100:
                     wb_candidates = all_cands
 
                 # Try External In-Situ Probing Fallback Chain (Method 3 -> 2 -> 1)

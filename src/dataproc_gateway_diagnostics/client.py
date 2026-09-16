@@ -777,9 +777,9 @@ class GatewayDiagnosticClient:
             },
             "method_1_gce_exec": {
                 "name": "Method 1 Non-Intr. SSH",
-                "role": "compute.instances.setMetadata",
+                "role": "roles/iap.tunnelResourceAccessor",
                 "granted": True,
-                "detail": "Requires CorpSSH/SSO or instance SSH keys",
+                "detail": "Supported via IAP tunnel (--tunnel-through-iap)",
             },
         }
 
