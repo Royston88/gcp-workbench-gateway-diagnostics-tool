@@ -25,7 +25,7 @@ produce, so the lowest-numbered FAIL is the one worth fixing first.
 
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .client import AccessDenied, DiagnosticError, GatewayDiagnosticClient, NotFound
 from .models import CheckResult, Status
@@ -246,6 +246,7 @@ def check_kernel_sessions(
     # Cache for looked-up notebook files and remote sessions to avoid duplicate queries
     looked_up_notebooks: Dict[str, Optional[str]] = {}
     probed_remote_sessions: Dict[str, Tuple[List[Dict[str, Any]], Optional[str], Optional[str]]] = {}
+    claimed_remote_sessions: Dict[str, Set[str]] = {}
 
     # Build active kernel IDs and kernels_detail
     active_kernel_ids = {k.get("id", "") for k in kernels if k.get("id")}
@@ -299,6 +300,7 @@ def check_kernel_sessions(
                 wb_owner = in_situ_wb.get("owner")
                 matched_wb_id = sess_info.get("session_id")
                 wb_notebook = sess_info.get("notebook_path") or sess_info.get("notebook_name")
+                confidence_str = " (100% confidence - in-situ local session)"
 
         # Step 2: Global / External Resolution (If not matched to local VM, resolve via inventory if available)
         if not is_local_match and assoc_app and wb_inventory:
@@ -307,6 +309,7 @@ def check_kernel_sessions(
             if wb_inst:
                 cand_details = wb_inst.get("candidate_details", [])
                 primary_cand = wb_inst
+                best_score = 100
                 confidence_str = ""
 
                 # If multiple candidates exist for this identity, disambiguate with Signals 1, 2, 3
@@ -363,6 +366,9 @@ def check_kernel_sessions(
                             confidence_str = " (0% confidence - unranked among STOPPED instances)"
                         else:
                             confidence_str = " (0% confidence - no signals active)"
+                else:
+                    best_score = 100
+                    confidence_str = " (100% confidence - unique associated instance)"
 
                 wb_vm = primary_cand.get("name")
                 wb_state = primary_cand.get("state")
@@ -388,17 +394,26 @@ def check_kernel_sessions(
                     remote_sessions, method_used, remote_probe_err = probed_remote_sessions[wb_vm]
 
                 if remote_sessions:
-                    # Match session by kernel ID or last_activity
+                    vm_claimed = claimed_remote_sessions.setdefault(wb_vm or "", set())
+                    # Match session by kernel ID
                     for sess in remote_sessions:
                         sk = sess.get("kernel") or {}
+                        sid = sess.get("id")
                         if sk.get("id") == k_id:
-                            matched_wb_id = sess.get("id")
+                            matched_wb_id = sid
                             wb_notebook = sess.get("path") or sess.get("name")
+                            if sid:
+                                vm_claimed.add(sid)
                             break
-                    if not wb_notebook and remote_sessions:
-                        # Fall back to first session
-                        matched_wb_id = remote_sessions[0].get("id")
-                        wb_notebook = remote_sessions[0].get("path") or remote_sessions[0].get("name")
+                    if not wb_notebook:
+                        # Fall back to first unclaimed session on this VM
+                        for sess in remote_sessions:
+                            sid = sess.get("id")
+                            if sid and sid not in vm_claimed:
+                                matched_wb_id = sid
+                                wb_notebook = sess.get("path") or sess.get("name")
+                                vm_claimed.add(sid)
+                                break
 
                 # If remote probing didn't resolve the notebook file, fall back to Cloud Logging Serial Trace
                 if not wb_notebook and inst_id:

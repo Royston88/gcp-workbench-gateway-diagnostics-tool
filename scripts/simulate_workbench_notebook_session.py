@@ -152,6 +152,7 @@ def main() -> None:
         help="Relative or absolute notebook path",
     )
     parser.add_argument("--kernel-name", default="python3", help="Kernel spec name (default: python3)")
+    parser.add_argument("--kernel-id", help="Optional explicit kernel UUID to attach/correlate")
     parser.add_argument("--session-id", help="Session ID to delete (for action=delete)")
     parser.add_argument(
         "--in-situ",
@@ -194,11 +195,15 @@ elif action == "create":
     opener.open(f"{{base_url}}/lab")
     xsrf = next((c.value for c in cj if c.name == "_xsrf"), None)
     
+    kernel_payload = {{"name": {args.kernel_name!r}}}
+    if {args.kernel_id!r}:
+        kernel_payload["id"] = {args.kernel_id!r}
+    
     body = json.dumps({{
         "path": {args.notebook_path!r},
         "type": "notebook",
         "name": os.path.basename({args.notebook_path!r}),
-        "kernel": {{"name": {args.kernel_name!r}}}
+        "kernel": kernel_payload
     }}).encode("utf-8")
     
     req = urllib.request.Request(
@@ -212,6 +217,18 @@ elif action == "create":
     )
     with opener.open(req) as resp:
         print(resp.read().decode("utf-8"))
+elif action == "delete":
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    opener.open(f"{{base_url}}/lab")
+    xsrf = next((c.value for c in cj if c.name == "_xsrf"), None)
+    req = urllib.request.Request(
+        f"{{base_url}}/api/sessions/{args.session_id}",
+        headers={{"X-XSRFToken": xsrf}},
+        method="DELETE",
+    )
+    with opener.open(req) as resp:
+        print(json.dumps({{"deleted": resp.status in (200, 204)}}))
 """
     logger.info("Executing remote %s on %s...", args.action, args.vm_name)
     out = run_remote_python(args.vm_name, args.zone, args.project, remote_code)
