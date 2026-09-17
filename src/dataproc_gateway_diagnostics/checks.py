@@ -164,6 +164,34 @@ def _skip_result(check_id: int, name: str, exc: Exception) -> CheckResult:
     return result
 
 
+def _user_matches(target: Optional[str], candidate: Optional[str]) -> bool:
+    """Check if target user identifier matches candidate user."""
+    if not target or not candidate:
+        return False
+    t = target.lower().replace("-", "_").split("@")[0]
+    c = candidate.lower().replace("-", "_").split("@")[0]
+    return t == c or t in c or c in t
+
+
+def resolve_scoped_user(client: GatewayDiagnosticClient) -> Optional[str]:
+    """Determine calling tenant username for session scoping."""
+    in_situ_wb = (
+        client.local_workbench_sessions()
+        if hasattr(client, "local_workbench_sessions")
+        else {"is_workbench": False}
+    )
+    if in_situ_wb.get("is_workbench"):
+        if in_situ_wb.get("owner"):
+            return in_situ_wb.get("owner").split("@")[0]
+        sa_email = client.active_account or ""
+        if "@" in sa_email:
+            return sa_email.split("@")[0]
+        return in_situ_wb.get("vm_name")
+    else:
+        sa_email = client.active_account or ""
+        return sa_email.split("@")[0] if "@" in sa_email else sa_email
+
+
 # ----------------------------------------------------------------------
 # Check 1 - zombie / idle kernel sessions
 # ----------------------------------------------------------------------
@@ -171,9 +199,14 @@ def check_kernel_sessions(
     client: GatewayDiagnosticClient,
     idle_hours: float = DEFAULT_IDLE_HOURS,
     app_age_hours: float = DEFAULT_APP_AGE_HOURS,
+    my_sessions_only: bool = False,
+    scoped_user: Optional[str] = None,
 ) -> CheckResult:
     name = "Zombie / Idle Kernel Sessions"
     result = CheckResult(check_id=1, name=name)
+
+    if my_sessions_only and not scoped_user:
+        scoped_user = resolve_scoped_user(client)
 
     try:
         kernels = client.kernels()
@@ -494,6 +527,8 @@ def check_kernel_sessions(
                 "idle_seconds": idle_seconds,
                 "connections": int(kernel.get("connections", 0) or 0),
                 "associated_yarn_app": assoc_app_id,
+                "yarn_user": assoc_app.get("user") if assoc_app else None,
+                "is_local_match": is_local_match,
                 "workbench_vm": wb_vm,
                 "workbench_vm_explanation": wb_vm_explanation,
                 "workbench_state": wb_state,
@@ -576,27 +611,105 @@ def check_kernel_sessions(
             }
         )
 
+    total_cluster_kernels = len(kernels)
+    total_cluster_yarn_apps = len(running_apps)
+
+    scoped_kernels_detail = kernels_detail
+    scoped_yarn_apps_detail = yarn_apps_detail
+    scoped_idle_kernels = idle_kernels
+    scoped_long_running = long_running
+    scoped_busy = busy
+    scoped_max_idle = max_idle
+    scoped_orphaned_count = orphaned_count
+    omitted_kernels = 0
+    omitted_yarn_apps = 0
+
+    if my_sessions_only:
+        # Determine caller matching kernels
+        scoped_k_detail = []
+        my_kernel_ids = set()
+        for kd in kernels_detail:
+            is_mine = False
+            if kd.get("is_local_match"):
+                is_mine = True
+            elif in_situ_wb.get("is_workbench") and kd.get("workbench_vm") == in_situ_wb.get("vm_name"):
+                is_mine = True
+            elif scoped_user:
+                yu = kd.get("yarn_user")
+                if _user_matches(scoped_user, yu):
+                    is_mine = True
+                wo = kd.get("workbench_owner")
+                if _user_matches(scoped_user, wo):
+                    is_mine = True
+            if is_mine:
+                scoped_k_detail.append(kd)
+                my_kernel_ids.add(kd["id"])
+
+        # Determine caller matching YARN apps
+        scoped_y_detail = []
+        for ad in yarn_apps_detail:
+            is_mine = False
+            if ad.get("associated_kernel_id") and ad["associated_kernel_id"] in my_kernel_ids:
+                is_mine = True
+            elif scoped_user and _user_matches(scoped_user, ad.get("user")):
+                is_mine = True
+            if is_mine:
+                scoped_y_detail.append(ad)
+
+        scoped_kernels_detail = scoped_k_detail
+        scoped_yarn_apps_detail = scoped_y_detail
+        omitted_kernels = total_cluster_kernels - len(scoped_kernels_detail)
+        omitted_yarn_apps = total_cluster_yarn_apps - len(scoped_yarn_apps_detail)
+
+        # Recalculate scoped idle/busy/long-running/orphans
+        scoped_idle_kernels = [ik for ik in idle_kernels if ik[0] in my_kernel_ids]
+        scoped_busy = sum(1 for kd in scoped_kernels_detail if kd["execution_state"] == "busy")
+        scoped_max_idle = max([kd["idle_seconds"] for kd in scoped_kernels_detail], default=0.0)
+        scoped_my_app_ids = {ad["id"] for ad in scoped_yarn_apps_detail}
+        scoped_long_running = [lr for lr in long_running if lr[0] in scoped_my_app_ids]
+        scoped_orphaned_count = sum(1 for ad in scoped_yarn_apps_detail if ad["is_orphaned"])
+
     # Populate result details
-    result.add("Active kernels", len(kernels))
-    result.add("Busy (executing)", busy)
-    result.add(f"Idle > {idle_hours:g}h", len(idle_kernels))
-    result.add("Longest idle", humanize_duration(max_idle) if kernels else "n/a")
-    if apps_error:
-        result.add("Running YARN applications", f"unavailable ({apps_error[:60]})")
-    else:
+    if my_sessions_only:
+        result.add("Scope", f"My sessions only (Identity: {scoped_user or 'unknown'})")
         result.add(
-            "Running YARN applications",
-            f"{len(running_apps)} (older than {app_age_hours:g}h: {len(long_running)})",
+            "Active kernels",
+            f"{len(scoped_kernels_detail)} (out of {total_cluster_kernels} cluster-wide)",
         )
+        result.add("Busy (executing)", scoped_busy)
+        result.add(f"Idle > {idle_hours:g}h", len(scoped_idle_kernels))
+        result.add(
+            "Longest idle",
+            humanize_duration(scoped_max_idle) if scoped_kernels_detail else "n/a",
+        )
+        if apps_error:
+            result.add("Running YARN applications", f"unavailable ({apps_error[:60]})")
+        else:
+            result.add(
+                "Running YARN applications",
+                f"{len(scoped_yarn_apps_detail)} (out of {total_cluster_yarn_apps} cluster-wide; older than {app_age_hours:g}h: {len(scoped_long_running)})",
+            )
+    else:
+        result.add("Active kernels", len(kernels))
+        result.add("Busy (executing)", busy)
+        result.add(f"Idle > {idle_hours:g}h", len(idle_kernels))
+        result.add("Longest idle", humanize_duration(max_idle) if kernels else "n/a")
+        if apps_error:
+            result.add("Running YARN applications", f"unavailable ({apps_error[:60]})")
+        else:
+            result.add(
+                "Running YARN applications",
+                f"{len(running_apps)} (older than {app_age_hours:g}h: {len(long_running)})",
+            )
 
     # Configuration Status
     result.add("--- Configuration Status ---", "")
     result.add("YARN Application Lifetime", yarn_lifetime_val)
 
     # Active Kernel Gateway Sessions
-    if kernels_detail:
+    if scoped_kernels_detail:
         result.add("--- Active Kernel Gateway Sessions ---", "")
-        for kd in kernels_detail:
+        for kd in scoped_kernels_detail:
             k_id_short = kd["id"][:8] if len(kd["id"]) > 8 else kd["id"]
             result.add(f"[Kernel] {k_id_short}...", kd["name"])
             result.add("      * Workbench VM", kd["workbench_vm_display"])
@@ -613,11 +726,22 @@ def check_kernel_sessions(
             )
             assoc = kd.get("associated_yarn_app") or "None (launching or non-YARN)"
             result.add("      * Associated YARN App", assoc)
+        if my_sessions_only and omitted_kernels > 0:
+            result.add(
+                "Note",
+                f"{omitted_kernels} session(s) from peer tenants omitted (re-run without --my-sessions-only for full cluster audit)",
+            )
+    elif my_sessions_only and omitted_kernels > 0:
+        result.add("--- Active Kernel Gateway Sessions ---", "")
+        result.add(
+            "Note",
+            f"0 personal sessions active ({omitted_kernels} session(s) from peer tenants omitted; re-run without --my-sessions-only for full cluster audit)",
+        )
 
     # Running YARN Applications
-    if yarn_apps_detail:
+    if scoped_yarn_apps_detail:
         result.add("--- Running YARN Applications ---", "")
-        for ad in yarn_apps_detail:
+        for ad in scoped_yarn_apps_detail:
             result.add(f"[{ad['app_type']}] {ad['id']}", "")
             result.add("      * Name", ad["name"])
             result.add("      * User", ad["user"])
@@ -634,23 +758,40 @@ def check_kernel_sessions(
                 result.add(
                     "      * Status", "No active gateway session; driver still alive"
                 )
+        if my_sessions_only and omitted_yarn_apps > 0:
+            result.add(
+                "Note",
+                f"{omitted_yarn_apps} application(s) from peer tenants omitted",
+            )
+    elif my_sessions_only and omitted_yarn_apps > 0:
+        result.add("--- Running YARN Applications ---", "")
+        result.add(
+            "Note",
+            f"0 personal applications active ({omitted_yarn_apps} application(s) from peer tenants omitted)",
+        )
 
     result.metrics = {
-        "active_kernels": len(kernels),
-        "busy_kernels": busy,
-        "idle_kernels": len(idle_kernels),
+        "active_kernels": len(scoped_kernels_detail),
+        "total_cluster_kernels": total_cluster_kernels,
+        "busy_kernels": scoped_busy,
+        "idle_kernels": len(scoped_idle_kernels),
         "idle_threshold_hours": idle_hours,
-        "max_idle_seconds": max_idle,
-        "running_yarn_apps": len(running_apps),
-        "long_running_apps": len(long_running),
-        "orphaned_yarn_apps": orphaned_count,
+        "max_idle_seconds": scoped_max_idle,
+        "running_yarn_apps": len(scoped_yarn_apps_detail),
+        "total_cluster_yarn_apps": total_cluster_yarn_apps,
+        "long_running_apps": len(scoped_long_running),
+        "orphaned_yarn_apps": scoped_orphaned_count,
         "app_age_threshold_hours": app_age_hours,
+        "my_sessions_only": my_sessions_only,
+        "scoped_user": scoped_user,
+        "omitted_kernels": omitted_kernels,
+        "omitted_yarn_apps": omitted_yarn_apps,
         "yarn_lifetime_config": {
             "expiry_time": yarn_lifetime_val,
             "is_unlimited": is_yarn_unlimited,
         },
-        "kernels_detail": kernels_detail,
-        "yarn_apps_detail": yarn_apps_detail,
+        "kernels_detail": scoped_kernels_detail,
+        "yarn_apps_detail": scoped_yarn_apps_detail,
     }
 
     remediation = []
@@ -660,33 +801,40 @@ def check_kernel_sessions(
             "(yarn:yarn.resourcemanager.app-lifetime-monitor.enable=true, "
             "yarn:yarn.resourcemanager.app.max-lifetime=86400) to automatically terminate abandoned sessions."
         )
-    if orphaned_count > 0:
+    if scoped_orphaned_count > 0:
         remediation.append(
-            f"Kill {orphaned_count} orphaned YARN application(s): "
+            f"Kill {scoped_orphaned_count} orphaned YARN application(s): "
             "yarn application -kill <APP_ID> or via YARN ResourceManager Web UI."
         )
     remediation.append(
         "Shut down abandoned kernels via JupyterLab: 'Running Terminals and Kernels' tab in the left sidebar, or Kernel > Shut Down All Kernels."
     )
 
-    if idle_kernels or long_running or orphaned_count > 0:
+    if scoped_idle_kernels or scoped_long_running or scoped_orphaned_count > 0:
         result.status = Status.FAIL
         orphan_phrase = (
-            f" (including {orphaned_count} orphaned app{'s' if orphaned_count > 1 else ''})"
-            if orphaned_count
+            f" (including {scoped_orphaned_count} orphaned app{'s' if scoped_orphaned_count > 1 else ''})"
+            if scoped_orphaned_count
             else ""
         )
+        noun = "personal " if my_sessions_only else ""
         result.summary = (
-            f"{len(idle_kernels)} idle kernel(s) and {len(long_running)} long-running "
+            f"{len(scoped_idle_kernels)} {noun}idle kernel(s) and {len(scoped_long_running)} long-running "
             f"YARN application(s){orphan_phrase} are holding ApplicationMaster capacity."
         )
         result.remediation = remediation
-    elif not kernels:
+    elif not scoped_kernels_detail:
         result.status = Status.PASS
-        result.summary = "No active kernel sessions on the gateway."
+        if my_sessions_only:
+            result.summary = (
+                f"No active personal kernel sessions on the gateway ({total_cluster_kernels} active on cluster)."
+            )
+        else:
+            result.summary = "No active kernel sessions on the gateway."
     else:
         result.status = Status.PASS
-        result.summary = f"{len(kernels)} active kernel(s), none idle beyond threshold."
+        noun = "personal " if my_sessions_only else ""
+        result.summary = f"{len(scoped_kernels_detail)} active {noun}kernel(s), none idle beyond threshold."
 
     return result
 
@@ -694,9 +842,16 @@ def check_kernel_sessions(
 # ----------------------------------------------------------------------
 # Check 2 - YARN ApplicationMaster capacity  (primary hypothesis)
 # ----------------------------------------------------------------------
-def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
+def check_am_capacity(
+    client: GatewayDiagnosticClient,
+    my_sessions_only: bool = False,
+    scoped_user: Optional[str] = None,
+) -> CheckResult:
     name = "YARN ApplicationMaster Capacity"
     result = CheckResult(check_id=2, name=name)
+
+    if my_sessions_only and not scoped_user:
+        scoped_user = resolve_scoped_user(client)
 
     try:
         scheduler = client.yarn_scheduler()
@@ -762,18 +917,25 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
     if isinstance(users_data, dict):
         users_data = [users_data]
     active_users: List[Dict[str, Any]] = []
+    my_am_used_mb = 0
+    my_active_apps = 0
     for u in users_data:
         num_act = int(u.get("numActiveApplications", 0) or 0)
         num_pend = int(u.get("numPendingApplications", 0) or 0)
         if num_act > 0 or num_pend > 0:
+            uname = u.get("username", "?")
+            am_used = _resource_mb(u.get("AMResourceUsed")) or 0
             active_users.append(
                 {
-                    "username": u.get("username", "?"),
+                    "username": uname,
                     "active_apps": num_act,
                     "pending_apps": num_pend,
-                    "am_used_mb": _resource_mb(u.get("AMResourceUsed")) or 0,
+                    "am_used_mb": am_used,
                 }
             )
+            if my_sessions_only and scoped_user and _user_matches(scoped_user, uname):
+                my_am_used_mb += am_used
+                my_active_apps += num_act
 
     # The decisive signature: applications are queued while the cluster still
     # has free memory, which means admission control -- not genuine capacity --
@@ -794,14 +956,32 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
         f"{humanize_mb(worst['used_am_mb'])} / {humanize_mb(worst['am_limit_mb'])}"
         f"  ({saturation * 100:.1f}%)",
     )
+    if my_sessions_only:
+        my_pct = (
+            (my_am_used_mb / worst["am_limit_mb"] * 100.0)
+            if worst["am_limit_mb"]
+            else 0.0
+        )
+        result.add(
+            "My AM allocation",
+            f"{humanize_mb(my_am_used_mb)} ({my_pct:.1f}% of AM limit, {my_active_apps} app(s))",
+        )
     result.add("Applications ACTIVE", worst["num_active"])
     result.add("Applications PENDING (ACCEPTED)", pending)
     if active_users:
-        user_summaries = [
-            f"{u['username']} ({u['active_apps']} app(s), AM: {humanize_mb(u['am_used_mb'])})"
-            for u in active_users
-        ]
-        result.add("Active queue user(s)", ", ".join(user_summaries))
+        if my_sessions_only:
+            peer_count = max(0, len(active_users) - (1 if my_active_apps > 0 else 0))
+            if my_active_apps > 0:
+                user_desc = f"You ({my_active_apps} app(s), AM: {humanize_mb(my_am_used_mb)}) + {peer_count} peer tenant(s)"
+            else:
+                user_desc = f"0 apps by you; {len(active_users)} peer tenant(s) active"
+            result.add("Active queue user(s)", f"{user_desc} (peer usernames masked)")
+        else:
+            user_summaries = [
+                f"{u['username']} ({u['active_apps']} app(s), AM: {humanize_mb(u['am_used_mb'])})"
+                for u in active_users
+            ]
+            result.add("Active queue user(s)", ", ".join(user_summaries))
     result.add(
         "Cluster memory",
         f"{humanize_mb(allocated_mb)} used / {humanize_mb(total_mb)} total"
@@ -825,7 +1005,23 @@ def check_am_capacity(client: GatewayDiagnosticClient) -> CheckResult:
         "cluster_total_mb": total_mb,
         "cluster_apps_pending": apps_pending,
         "starved_with_free_memory": starved_with_free_memory,
-        "active_users": active_users,
+        "my_sessions_only": my_sessions_only,
+        "my_am_used_mb": my_am_used_mb if my_sessions_only else None,
+        "my_active_apps": my_active_apps if my_sessions_only else None,
+        "active_users": [
+            {
+                "active_apps": u["active_apps"],
+                "pending_apps": u["pending_apps"],
+                "am_used_mb": u["am_used_mb"],
+                "username": (
+                    u["username"]
+                    if not my_sessions_only
+                    or (scoped_user and _user_matches(scoped_user, u["username"]))
+                    else "[MASKED_PEER_TENANT]"
+                ),
+            }
+            for u in active_users
+        ],
     }
 
     remediation = [
@@ -1081,13 +1277,28 @@ def run_checks(
     app_age_hours: float = DEFAULT_APP_AGE_HOURS,
     lookback_days: int = DEFAULT_TIMEOUT_LOOKBACK_DAYS,
     expected_users: int = DEFAULT_EXPECTED_USERS,
+    my_sessions_only: bool = False,
+    scoped_user: Optional[str] = None,
 ) -> List[CheckResult]:
     """Run the requested checks, isolating failures so one bad check cannot
     abort the rest of the run."""
+    if my_sessions_only and not scoped_user:
+        scoped_user = resolve_scoped_user(client)
+
     wanted = set(selected or ALL_CHECKS.keys())
     runners = {
-        1: lambda: check_kernel_sessions(client, idle_hours, app_age_hours),
-        2: lambda: check_am_capacity(client),
+        1: lambda: check_kernel_sessions(
+            client,
+            idle_hours=idle_hours,
+            app_age_hours=app_age_hours,
+            my_sessions_only=my_sessions_only,
+            scoped_user=scoped_user,
+        ),
+        2: lambda: check_am_capacity(
+            client,
+            my_sessions_only=my_sessions_only,
+            scoped_user=scoped_user,
+        ),
         3: lambda: check_launch_timeouts(client, lookback_days),
         4: lambda: check_driver_sizing(client, expected_users),
     }

@@ -34,6 +34,7 @@ from .checks import (
     DEFAULT_EXPECTED_USERS,
     DEFAULT_IDLE_HOURS,
     DEFAULT_TIMEOUT_LOOKBACK_DAYS,
+    resolve_scoped_user,
     run_checks,
 )
 from .client import AccessDenied, DiagnosticError, GatewayDiagnosticClient
@@ -55,6 +56,7 @@ def build_report(
     app_age_hours: float = DEFAULT_APP_AGE_HOURS,
     lookback_days: int = DEFAULT_TIMEOUT_LOOKBACK_DAYS,
     expected_users: int = DEFAULT_EXPECTED_USERS,
+    my_sessions_only: bool = False,
 ) -> GatewayDiagnosticReport:
     """Collect cluster metadata and run the requested checks."""
     cluster = client.get_cluster()
@@ -71,6 +73,8 @@ def build_report(
         else {}
     )
 
+    scoped_user = resolve_scoped_user(client) if my_sessions_only else None
+
     report = GatewayDiagnosticReport(
         tool_version=__version__,
         project_id=client.project_id,
@@ -83,6 +87,8 @@ def build_report(
         generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         execution_context=execution_context,
         iam_capabilities=iam_capabilities,
+        my_sessions_only=my_sessions_only,
+        scoped_user=scoped_user,
     )
     report.checks = run_checks(
         client,
@@ -91,7 +97,14 @@ def build_report(
         app_age_hours=app_age_hours,
         lookback_days=lookback_days,
         expected_users=expected_users,
+        my_sessions_only=my_sessions_only,
+        scoped_user=scoped_user,
     )
+    for check in report.checks:
+        if check.check_id == 1 and check.metrics:
+            report.total_cluster_kernels = check.metrics.get("total_cluster_kernels", 0)
+            report.total_cluster_yarn_apps = check.metrics.get("total_cluster_yarn_apps", 0)
+            break
     return report
 
 
@@ -114,6 +127,10 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         lines.append(f"Active Account    : {report.active_account}")
     if report.execution_context and report.execution_context.get("display"):
         lines.append(f"Execution Context : {report.execution_context['display']}")
+    if report.my_sessions_only:
+        lines.append(
+            f"Diagnostic Scope  : Filtered to My Sessions Only (Tenant: {report.scoped_user or 'unknown'})"
+        )
     lines.append(THIN)
 
     # Pre-Flight IAM Permissions & Diagnostic Capabilities Matrix
@@ -187,6 +204,8 @@ def render_text(report: GatewayDiagnosticReport) -> str:
                 lines.append(f"{label:<36}: {value}")
             elif label.startswith("[Kernel]"):
                 lines.append(f"\n   -> {label:<30}: {value}")
+            elif label == "Note" or label.startswith("Note") or label.startswith("-> Note"):
+                lines.append(f"\n   -> Note: {value}")
             else:
                 lines.append(f"   -> {label:<30}: {value}")
         if check.details:
@@ -340,6 +359,11 @@ Examples:
             f"ceiling (default: {DEFAULT_EXPECTED_USERS})."
         ),
     )
+    parser.add_argument(
+        "--my-sessions-only",
+        action="store_true",
+        help="Filter diagnostic output to only show the calling user's sessions and YARN applications.",
+    )
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds.")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     parser.add_argument("--verbose", action="store_true", help="Log every HTTP request.")
@@ -370,6 +394,7 @@ Examples:
             app_age_hours=args.app_age_hours,
             lookback_days=args.lookback_days,
             expected_users=args.expected_users,
+            my_sessions_only=args.my_sessions_only,
         )
     except AccessDenied as exc:
         print(f"[!] Permission denied: {exc}", file=sys.stderr)

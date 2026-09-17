@@ -99,6 +99,10 @@ class GatewayDiagnosticReport:
     generated_at: str = ""
     execution_context: Dict[str, Any] = field(default_factory=dict)
     iam_capabilities: Dict[str, Any] = field(default_factory=dict)
+    my_sessions_only: bool = False
+    scoped_user: Optional[str] = None
+    total_cluster_kernels: int = 0
+    total_cluster_yarn_apps: int = 0
     checks: List[CheckResult] = field(default_factory=list)
 
     @property
@@ -135,6 +139,10 @@ class GatewayDiagnosticReport:
             "active_account": self.active_account,
             "execution_context": self.execution_context,
             "iam_capabilities": self.iam_capabilities,
+            "my_sessions_only": self.my_sessions_only,
+            "scoped_user": self.scoped_user,
+            "total_cluster_kernels": self.total_cluster_kernels,
+            "total_cluster_yarn_apps": self.total_cluster_yarn_apps,
             "overall_status": self.overall_status,
             "primary_root_cause": primary.name if primary else None,
             "checks": [c.to_dict() for c in self.checks],
