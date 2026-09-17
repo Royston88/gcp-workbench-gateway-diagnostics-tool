@@ -31,7 +31,7 @@ There are four plausible causes, and they have **conflicting remediations**. Add
 
 ## Step 1 — Confirm prerequisites
 
-**The cluster must have Component Gateway enabled.** Checks 1 and 2 read YARN through it.
+**The cluster must have Component Gateway enabled.** Checks 1 and 2 read YARN and Jupyter Kernel Gateway through it.
 
 ```bash
 gcloud dataproc clusters describe <CLUSTER> --region=<REGION> \
@@ -40,60 +40,79 @@ gcloud dataproc clusters describe <CLUSTER> --region=<REGION> \
 
 Expect `True`. If empty or `False`, Checks 1 and 2 will report `SKIPPED`.
 
+### User Personas & Access Models
+
+The diagnostic tool is designed for two distinct operational personas with different visibility requirements and permission boundaries:
+
+| Persona | Primary Goal | Recommended Execution Mode | Required IAM Permissions | Diagnostic Visibility |
+|---|---|---|---|---|
+| **Platform Administrator / Cluster Operator / SRE** | Full fleet audit, cluster capacity planning, triaging multi-tenant AM starvation, identifying rogue/abandoned tenant kernels and orphaned YARN apps across all users. | **Full Cluster Audit (Default)**<br>`gateway-diag diagnose --cluster=<CLUSTER>` | **Comprehensive Diagnostic Suite:**<br>• `dataproc.clusters.get`<br>• `dataproc.clusters.use`<br>• `logging.entries.list`<br>• *Optional:* `notebooks.instances.list`, `compute.instances.get`, `monitoring.timeSeries.list` | **Full Visibility:**<br>• All active kernels across all tenants<br>• All running YARN apps across the cluster<br>• Project-wide Workbench VM inventory & creator identities<br>• Multi-VM candidate disambiguation (Signals 1–3)<br>• Full unmasked multi-tenant YARN user breakdown |
+| **Regular Data Scientist / Notebook User** | Self-service troubleshooting when personal notebook kernels fail to launch (`HTTP 500` / `TimeoutError`), checking personal AM allocation without seeing peer tenant workloads. | **Personal Scoped Audit**<br>`gateway-diag diagnose --cluster=<CLUSTER> --my-sessions-only` | **Irreducible Minimum (Standard Notebook Access):**<br>• `dataproc.clusters.get`<br>• `dataproc.clusters.use`<br>*(Zero extra admin, logging, or compute permissions needed)* | **Zero-Leakage Personal View:**<br>• Strictly caller's active notebook session(s) and YARN app(s)<br>• 100% fidelity in-situ session correlation (local notebook file & sidebar UI ID)<br>• Personal AM allocation (`My AM allocation: X GB`)<br>• Peer tenant sessions/apps omitted; peer usernames masked |
+
+---
+
 ### Required IAM Permissions & Technical Rationale
 
 The required permissions must be granted to the **identity executing the script**:
-* **Inside Vertex AI Workbench (notebook cell or terminal):** Grant the roles to the **Workbench Instance Service Account** (e.g. `ds-user-1-svc@<PROJECT>.iam.gserviceaccount.com`), or to the end-user identity if user credential delegation is enabled.
-* **Outside Workbench (Cloud Shell, Cloudtop, local developer machine):** Grant the roles to the authenticating user account (`gcloud auth login`) or service account (`GOOGLE_APPLICATION_CREDENTIALS`).
+* **Inside Vertex AI Workbench (notebook cell or terminal):** Grant roles to the **Workbench Instance Service Account** (e.g. `ds-user-1-svc@<PROJECT>.iam.gserviceaccount.com`), or to the end-user identity if user credential delegation is enabled.
+* **Outside Workbench (Cloud Shell, Cloudtop, local developer machine):** Grant roles to the authenticating user account (`gcloud auth login`) or service account (`GOOGLE_APPLICATION_CREDENTIALS`).
 
-#### Permissions Matrix
+#### Permissions Matrix by Persona Tier
 
-| Predefined Role | Minimum IAM Permission | Target API / Endpoint Called | Technical Rationale & Failure Mode |
-|---|---|---|---|
-| `roles/dataproc.viewer` | `dataproc.clusters.get` | `GET https://dataproc.googleapis.com/v1/projects/{project}/regions/{region}/clusters/{cluster}` | **Cluster Metadata & Endpoint Resolution:** Discovers cluster state, hardware capacity, cluster software properties (`softwareConfig.properties` for YARN and Jupyter settings), and reads `config.endpointConfig.httpPorts` to discover dynamic reverse-proxy Component Gateway URLs.<br><br>*Failure Mode:* If missing, the script halts immediately with `AccessDenied` (`HTTP 403`). |
-| `roles/dataproc.editor` *(or custom role)* | `dataproc.clusters.use` | HTTP requests routed via `https://<hash>.dataproc.googleusercontent.com/gateway/default/...` | **Component Gateway Ingress:** Authorizes HTTP requests routed through Google Cloud Component Gateway to access cluster-internal Web UIs without VPN or SSH tunnels.<br>Specifically accesses:<br>1. **YARN ResourceManager REST API** (`/ws/v1/cluster/metrics`, `/ws/v1/cluster/scheduler`, `/ws/v1/cluster/apps`) for Checks 1, 2, and 4.<br>2. **Jupyter Kernel Gateway REST API** (`/api/kernels`) for Check 1.<br><br>*Key Gotcha:* `roles/dataproc.viewer` **does not** include `dataproc.clusters.use`. Accessing Component Gateway endpoints with only `dataproc.viewer` results in `HTTP 403 Forbidden`. |
-| `roles/logging.viewer` | `logging.entries.list` | `POST https://logging.googleapis.com/v2/entries:list` | **Log Inspection:** Queries Cloud Logging for `resource.type="cloud_dataproc_cluster"` and `log_name=.../jupyter_kernel_gateway` to detect kernel launch timeout exceptions, cold-start latency, and stack traces (Check 3).<br><br>*Failure Mode:* If missing, Check 3 degrades gracefully to `[?] SKIPPED`. |
+| Tier | Predefined Role | Minimum IAM Permission | Target API / Endpoint Called | Technical Rationale & Failure Mode |
+|---|---|---|---|---|
+| **Tier 1: Irreducible Minimum (Data Scientist)** | `roles/dataproc.viewer` | `dataproc.clusters.get` | `GET https://dataproc.googleapis.com/v1/projects/{project}/regions/{region}/clusters/{cluster}` | **Cluster Discovery & Component Gateway Resolution:** Discovers cluster state, hardware capacity, and dynamic reverse-proxy Component Gateway URLs.<br><br>*Failure Mode:* If missing, the tool exits immediately with `AccessDenied` (`HTTP 403`). |
+| **Tier 1: Irreducible Minimum (Data Scientist)** | `roles/dataproc.editor` *(or custom role)* | `dataproc.clusters.use` | HTTP requests routed via `https://<hash>.dataproc.googleusercontent.com/gateway/default/...` | **Component Gateway Ingress:** Authorizes HTTP requests through Component Gateway to access:<br>1. **Jupyter Kernel Gateway REST API** (`/api/kernels`) for Check 1.<br>2. **YARN ResourceManager REST API** (`/ws/v1/cluster/scheduler`, `/metrics`, `/apps`) for Checks 1, 2, and 4.<br><br>*Key Gotcha:* `roles/dataproc.viewer` **does not** include `dataproc.clusters.use`. Both permissions are required for any notebook user to connect to Dataproc kernels. |
+| **Tier 2: Full Audit & Logs (Platform Admin)** | `roles/logging.viewer` | `logging.entries.list` | `POST https://logging.googleapis.com/v2/entries:list` | **Launch Timeout Analysis (Check 3):** Queries Cloud Logging for `log_name=.../jupyter_kernel_gateway` to detect kernel launch timeout exceptions and cold-start latency.<br><br>*Failure Mode:* For Data Scientists without this role, Check 3 degrades gracefully to `[!] DEGRADED / [?] SKIPPED` without affecting Checks 1, 2, or 4. |
+| **Tier 2: Multi-VM Disambiguation (Platform Admin)** | `roles/notebooks.viewer` + `roles/compute.viewer` | `notebooks.instances.list`<br>`compute.instances.get` | Vertex AI Workbench v2 API & Compute Engine REST API | **Cross-Tenant VM Resolution:** Discovers project-wide Workbench instances and reads Guest Attributes (Signal 1) to disambiguate which external VM owns which YARN application.<br><br>*Failure Mode:* Data Scientists running in-situ resolve their own VM locally via `127.0.0.1:8080` (100% confidence) without needing these APIs. External peer VMs are simply marked `[External to this VM]`. |
+| **Tier 2: Metrics & Probing (Platform Admin)** | `roles/monitoring.viewer`<br>`roles/iap.tunnelResourceAccessor` | `monitoring.timeSeries.list` | Cloud Monitoring & IAP Tunnel SSH | **Signal 3 & Remote Probing:** Reads VM network egress metrics (Signal 3) and allows Non-Intrusive SSH via IAP tunnel to inspect remote JupyterLab sessions on peer VMs.<br><br>*Failure Mode:* Automatically skipped if unpermitted. |
 
-#### Quick Grant (Predefined Roles)
+---
+
+### IAM Setup Recipes
+
+#### Recipe 1: Regular Data Scientist (Least-Privilege / In-Situ Workbench)
+
+A data scientist only needs the permissions already required to run notebooks against the Dataproc cluster. No administrative, logging, or compute permissions are needed:
 
 ```bash
-# For Vertex AI Workbench instance service account:
+# 1. Allow reading Dataproc cluster metadata
 gcloud projects add-iam-policy-binding <PROJECT> \
-    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
+    --member="serviceAccount:<DATA_SCIENTIST_WORKBENCH_SA>" \
     --role="roles/dataproc.viewer"
 
-gcloud projects add-iam-policy-binding <PROJECT> \
-    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
-    --role="roles/dataproc.editor"
+# 2. Allow connecting through Component Gateway (least-privilege custom role)
+gcloud iam roles create DataprocGatewayUser \
+    --project=<PROJECT_ID> \
+    --title="Dataproc Gateway User" \
+    --description="Minimal permissions for a data scientist to connect to Component Gateway and diagnose personal sessions" \
+    --permissions="dataproc.clusters.get,dataproc.clusters.use" \
+    --stage="GA"
 
-gcloud projects add-iam-policy-binding <PROJECT> \
-    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
-    --role="roles/logging.viewer"
+gcloud projects add-iam-policy-binding <PROJECT_ID> \
+    --member="serviceAccount:<DATA_SCIENTIST_WORKBENCH_SA>" \
+    --role="projects/<PROJECT_ID>/roles/DataprocGatewayUser"
 ```
 
-#### Least-Privilege Custom Role (Enterprise Standard)
+#### Recipe 2: Platform Administrator / Cluster Operator (Full Fleet Diagnostics)
 
-In security-conscious enterprise environments, granting `roles/dataproc.editor` may violate least-privilege compliance, as `dataproc.editor` permits cluster mutation and job submission. To provide strictly read-only diagnostic access, deploy this minimal Custom IAM Role:
+Deploy the comprehensive read-only `DataprocGatewayDiagnosticsAuditor` custom role for cluster administrators:
 
 ```bash
 gcloud iam roles create DataprocGatewayDiagnosticsAuditor \
     --project=<PROJECT_ID> \
     --title="Dataproc Gateway Diagnostics Auditor" \
-    --description="Read-only permissions for diagnosing Jupyter Kernel Gateway, YARN, and Workbench correlation" \
+    --description="Comprehensive read-only permissions for diagnosing Kernel Gateway, YARN capacity, Cloud Logging, and Workbench correlation" \
     --permissions="dataproc.clusters.get,dataproc.clusters.use,logging.entries.list,notebooks.instances.list,compute.instances.get,monitoring.timeSeries.list" \
     --stage="GA"
-```
 
-And bind it to the Workbench Service Account or user:
-
-```bash
 gcloud projects add-iam-policy-binding <PROJECT_ID> \
-    --member="serviceAccount:<WORKBENCH_SA_EMAIL>" \
+    --member="user:<ADMIN_USER_EMAIL>" \
     --role="projects/<PROJECT_ID>/roles/DataprocGatewayDiagnosticsAuditor"
 ```
 
 > [!NOTE]
-> Missing a role is not fatal. The affected check reports `[?] SKIPPED` with the exact role required, and the remaining checks still run.
+> Missing an optional role is not fatal. The pre-flight matrix in the CLI header will report `[!] DEGRADED` for that specific capability, and the affected check reports `[?] SKIPPED` with the exact remediation command while the remaining core checks continue to run.
 
 ---
 
@@ -128,7 +147,9 @@ import sys
 
 ## Step 3 — Run
 
-### Option A: Via Command Line (Terminal / Cloud Shell / Local)
+### Option A: Platform Admin / Cluster Operator (Full Fleet Audit)
+
+Run from an external terminal, Cloud Shell, Cloudtop, or CI/CD to inspect all cluster sessions, cross-VM disambiguation signals, and multi-tenant AM allocation:
 
 ```bash
 # Using the console script directly:
@@ -138,14 +159,18 @@ gateway-diag diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 python3 -m dataproc_gateway_diagnostics diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 ```
 
-### Option B: Inside Vertex AI Workbench (Notebook Cell)
+### Option B: Regular Data Scientist (Personal Scoped Audit)
+
+Run directly inside a **notebook cell** or terminal in Vertex AI Workbench. Using `--my-sessions-only` isolates diagnostics strictly to your own active notebook sessions and personal YARN capacity while omitting peer tenant details:
 
 ```python
 import sys
 PY = sys.executable
 
+# Personal scoped diagnosis (zero peer noise, zero permission errors):
 !{PY} -m dataproc_gateway_diagnostics diagnose \
-    --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+    --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER> \
+    --my-sessions-only
 ```
 
 > [!TIP]
