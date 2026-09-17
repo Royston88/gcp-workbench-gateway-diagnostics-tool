@@ -147,14 +147,24 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         # 3. Remote Notebook Probing
         ssh_probe = iam.get("remote_probing_ssh", {})
         log_probe = iam.get("remote_probing_logging", {})
+        ssh_ready = ssh_probe.get("granted", True)
+        log_ready = log_probe.get("granted", True)
+        is_in_situ = report.execution_context and report.execution_context.get("is_in_situ")
+        if ssh_ready and log_ready:
+            probe_status = "[✓] AVAILABLE (Non-Intr. SSH -> Cloud Logging Trace)"
+        elif ssh_ready or log_ready:
+            active_m = "Non-Intr. SSH" if ssh_ready else "Cloud Logging Trace"
+            probe_status = f"[!] DEGRADED ({active_m} only)"
+        else:
+            probe_status = "[!] UNAVAILABLE (Local in-situ only)" if is_in_situ else "[!] UNAVAILABLE (Admin permissions required)"
+        lines.append(f"   -> Remote Notebook Probing    : {probe_status}")
+        ssh_str = "READY" if ssh_ready else "UNAVAILABLE"
+        log_str = "ACTIVE" if log_ready else "UNAVAILABLE"
         lines.append(
-            "   -> Remote Notebook Probing    : [✓] AVAILABLE (Non-Intr. SSH -> Cloud Logging Trace)"
+            f"      * Non-Intr. SSH            : {ssh_str} ({ssh_probe.get('detail', 'Supported via IAP tunnel')})"
         )
         lines.append(
-            f"      * Non-Intr. SSH            : READY ({ssh_probe.get('detail', 'Supported via IAP tunnel')})"
-        )
-        lines.append(
-            f"      * Cloud Logging Trace      : ACTIVE ({log_probe.get('detail', 'Cloud Logging /lab/tree/ referer')})"
+            f"      * Cloud Logging Trace      : {log_str} ({log_probe.get('detail', 'Cloud Logging /lab/tree/ referer')})"
         )
         lines.append(THIN)
 

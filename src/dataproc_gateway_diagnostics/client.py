@@ -807,6 +807,8 @@ class GatewayDiagnosticClient:
             matrix["cloud_logging"]["detail"] = "Access Denied (roles/logging.viewer missing)"
             matrix["signal_2_serial_console"]["granted"] = False
             matrix["signal_2_serial_console"]["detail"] = "Access Denied (roles/logging.viewer missing)"
+            matrix["remote_probing_logging"]["granted"] = False
+            matrix["remote_probing_logging"]["detail"] = "Access Denied (roles/logging.viewer missing)"
         except Exception:
             pass
 
@@ -835,6 +837,16 @@ class GatewayDiagnosticClient:
         except AccessDenied:
             matrix["signal_3_cloud_monitoring"]["granted"] = False
             matrix["signal_3_cloud_monitoring"]["detail"] = "Access Denied (roles/monitoring.viewer missing)"
+        except Exception:
+            pass
+        try:
+            exec_ctx = self.execution_context()
+            if exec_ctx.get("is_in_situ"):
+                matrix["remote_probing_ssh"]["granted"] = False
+                matrix["remote_probing_ssh"]["detail"] = "Not applicable (in-situ local execution)"
+            elif matrix.get("workbench_inventory", {}).get("granted") is False:
+                matrix["remote_probing_ssh"]["granted"] = False
+                matrix["remote_probing_ssh"]["detail"] = "UNAVAILABLE (compute.instances.setMetadata missing)"
         except Exception:
             pass
 
