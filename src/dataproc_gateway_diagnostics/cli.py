@@ -100,6 +100,7 @@ def build_report(
         my_sessions_only=my_sessions_only,
         scoped_user=scoped_user,
     )
+    report.transport_mode = getattr(client, "active_transport", "")
     for check in report.checks:
         if check.check_id == 1 and check.metrics:
             report.total_cluster_kernels = check.metrics.get("total_cluster_kernels", 0)
@@ -125,6 +126,8 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         lines.append(f"Image Version     : {report.image_version}")
     if report.active_account:
         lines.append(f"Active Account    : {report.active_account}")
+    if report.transport_mode:
+        lines.append(f"Transport Mode    : {report.transport_mode}")
     if report.execution_context and report.execution_context.get("display"):
         lines.append(f"Execution Context : {report.execution_context['display']}")
     if report.my_sessions_only:
@@ -364,6 +367,16 @@ Examples:
         action="store_true",
         help="Filter diagnostic output to only show the calling user's sessions and YARN applications.",
     )
+    parser.add_argument(
+        "--transport",
+        default="auto",
+        choices=["auto", "gateway", "spark-job"],
+        help=(
+            "Data collection transport: 'gateway' (Method 1 Component Gateway HTTPS), "
+            "'spark-job' (Method 2 In-Cluster PySpark local[1] job), or 'auto' "
+            "(Method 1 with automatic fallback to Method 2 if Component Gateway is unreachable)."
+        ),
+    )
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds.")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     parser.add_argument("--verbose", action="store_true", help="Log every HTTP request.")
@@ -386,6 +399,7 @@ Examples:
             region=args.region,
             timeout=args.timeout,
             verbose=args.verbose,
+            transport=args.transport,
         )
         report = build_report(
             client,

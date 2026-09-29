@@ -84,6 +84,14 @@ def humanize_mb(mb: Optional[float]) -> str:
     return f"{int(mb)} MB"
 
 
+def humanize_mb_with_raw(mb: Optional[float]) -> str:
+    if mb is None:
+        return "unknown"
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB ({int(mb)} MB)"
+    return f"{int(mb)} MB"
+
+
 def parse_timestamp(value: str) -> Optional[datetime]:
     """Parse an ISO-8601 timestamp, tolerating 'Z' and fractional seconds."""
     if not value:
@@ -887,12 +895,37 @@ def check_am_capacity(
         used_am = _resource_mb(queue.get("usedAMResource")) or 0
         limit_am = _resource_mb(queue.get("AMResourceLimit")) or 0
         saturation = (used_am / limit_am) if limit_am else 0.0
+
+        partition_caps = (
+            (queue.get("capacities") or {}).get("queueCapacitiesByPartition") or [{}]
+        )[0]
+        raw_part_am = partition_caps.get("maxAMLimitPercentage")
+        raw_conf_am = queue.get("configuredMaxAMResourceLimit")
+        max_am_pct: Optional[float] = None
+        max_am_ratio: Optional[float] = None
+        for cand_val in (raw_part_am, raw_conf_am):
+            if cand_val is not None:
+                try:
+                    fval = float(cand_val)
+                    if fval > 1.0:
+                        max_am_pct = fval
+                        max_am_ratio = round(fval / 100.0, 4)
+                    else:
+                        max_am_ratio = fval
+                        max_am_pct = round(fval * 100.0, 2)
+                    break
+                except (ValueError, TypeError):
+                    pass
+
         row = {
             "queue": queue.get("queueName", "?"),
+            "capacity": queue.get("capacity"),
+            "absolute_capacity": queue.get("absoluteCapacity"),
             "used_am_mb": used_am,
             "am_limit_mb": limit_am,
             "saturation": saturation,
-            "max_am_percent": queue.get("configuredMaxAMResourceLimit"),
+            "max_am_percent": max_am_pct,
+            "max_am_ratio": max_am_ratio,
             "num_pending": int(queue.get("numPendingApplications", 0) or 0),
             "num_active": int(queue.get("numActiveApplications", 0) or 0),
             "max_applications": queue.get("maxApplications"),
@@ -911,6 +944,28 @@ def check_am_capacity(
     assert worst is not None
     saturation = worst["saturation"]
     pending = worst["num_pending"]
+
+    # Fetch ACCEPTED applications to extract YARN scheduler diagnostics strings
+    accepted_apps_raw: List[Dict[str, Any]] = []
+    try:
+        accepted_apps_raw = client.yarn_apps(states="ACCEPTED")
+    except (AccessDenied, NotFound, DiagnosticError):
+        pass
+
+    accepted_apps_detail: List[Dict[str, Any]] = []
+    for a in accepted_apps_raw:
+        u = a.get("user", "?")
+        if my_sessions_only and scoped_user and not _user_matches(scoped_user, u):
+            u = "[MASKED_PEER_TENANT]"
+        accepted_apps_detail.append(
+            {
+                "id": a.get("id", "?"),
+                "user": u,
+                "name": a.get("name", "?"),
+                "state": a.get("state", "ACCEPTED"),
+                "diagnostics": (a.get("diagnostics") or "").strip(),
+            }
+        )
 
     # Parse active users in the queue
     users_data = (worst.get("raw_queue", {}) or {}).get("users", {}).get("user", [])
@@ -945,16 +1000,32 @@ def check_am_capacity(
     ) and available_mb > FREE_MEMORY_SIGNIFICANT_MB
 
     result.add("Scheduler", scheduler_type)
-    result.add("Queue examined", worst["queue"])
+    cap_suffix = (
+        f" (capacity: {worst['capacity']}%, absolute: {worst['absolute_capacity']}%)"
+        if worst.get("capacity") is not None
+        else ""
+    )
+    result.add("Queue examined", f"{worst['queue']}{cap_suffix}")
     max_am_pct = worst["max_am_percent"]
+    max_am_ratio = worst["max_am_ratio"]
     result.add(
         "maximum-am-resource-percent",
-        f"{max_am_pct} (recommended >= 0.8)" if max_am_pct is not None else "unknown",
+        (
+            f"{max_am_pct:.1f}% ({max_am_ratio:g}) (recommended >= 80.0% / 0.8)"
+            if max_am_pct is not None and max_am_ratio is not None
+            else "unknown"
+        ),
     )
     result.add(
         "AM memory used / limit",
-        f"{humanize_mb(worst['used_am_mb'])} / {humanize_mb(worst['am_limit_mb'])}"
+        f"{humanize_mb_with_raw(worst['used_am_mb'])} / "
+        f"{humanize_mb_with_raw(worst['am_limit_mb'])}"
         f"  ({saturation * 100:.1f}%)",
+    )
+    user_am_lim = worst.get("user_am_limit_mb")
+    result.add(
+        "User AM resource limit",
+        humanize_mb_with_raw(user_am_lim),
     )
     if my_sessions_only:
         my_pct = (
@@ -964,28 +1035,46 @@ def check_am_capacity(
         )
         result.add(
             "My AM allocation",
-            f"{humanize_mb(my_am_used_mb)} ({my_pct:.1f}% of AM limit, {my_active_apps} app(s))",
+            f"{humanize_mb_with_raw(my_am_used_mb)} ({my_pct:.1f}% of AM limit, {my_active_apps} app(s))",
         )
     result.add("Applications ACTIVE", worst["num_active"])
     result.add("Applications PENDING (ACCEPTED)", pending)
+    if accepted_apps_detail:
+        for idx, acc in enumerate(accepted_apps_detail[:5], 1):
+            result.add(
+                f"Queued App [{idx}]",
+                f"{acc['id']} (User: {acc['user']} | Name: {acc['name']} | State: {acc['state']})",
+            )
+            result.add(
+                "  * YARN Diagnostics",
+                acc["diagnostics"] or "No diagnostic message reported by YARN RM",
+            )
+    else:
+        result.add(
+            "Queued App Diagnostics",
+            "None (no applications currently queued in ACCEPTED)",
+        )
     if active_users:
         if my_sessions_only:
             peer_count = max(0, len(active_users) - (1 if my_active_apps > 0 else 0))
             if my_active_apps > 0:
-                user_desc = f"You ({my_active_apps} app(s), AM: {humanize_mb(my_am_used_mb)}) + {peer_count} peer tenant(s)"
+                user_desc = f"You ({my_active_apps} app(s), AM: {humanize_mb_with_raw(my_am_used_mb)}) + {peer_count} peer tenant(s)"
             else:
                 user_desc = f"0 apps by you; {len(active_users)} peer tenant(s) active"
             result.add("Active queue user(s)", f"{user_desc} (peer usernames masked)")
         else:
             user_summaries = [
-                f"{u['username']} ({u['active_apps']} app(s), AM: {humanize_mb(u['am_used_mb'])})"
+                f"{u['username']} (active: {u['active_apps']}, pending: {u['pending_apps']}, AM: {humanize_mb_with_raw(u['am_used_mb'])})"
                 for u in active_users
             ]
             result.add("Active queue user(s)", ", ".join(user_summaries))
+    else:
+        result.add("Active queue user(s)", "None (0 active users in queue)")
     result.add(
         "Cluster memory",
-        f"{humanize_mb(allocated_mb)} used / {humanize_mb(total_mb)} total"
-        f"  ({humanize_mb(available_mb)} free)",
+        f"{humanize_mb_with_raw(allocated_mb)} used / "
+        f"{humanize_mb_with_raw(total_mb)} total"
+        f"  ({humanize_mb_with_raw(available_mb)} free)",
     )
     result.add(
         "maxApplications / per user",
@@ -1008,6 +1097,7 @@ def check_am_capacity(
         "my_sessions_only": my_sessions_only,
         "my_am_used_mb": my_am_used_mb if my_sessions_only else None,
         "my_active_apps": my_active_apps if my_sessions_only else None,
+        "accepted_apps": accepted_apps_detail,
         "active_users": [
             {
                 "active_apps": u["active_apps"],
