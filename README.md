@@ -116,11 +116,24 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 
 ---
 
-## Step 2 — Install
+## Step 2 — Install & Execution Options
 
-The tool can be installed either in an external terminal (Cloud Shell, Cloudtop, local workstation, CI/CD) or directly within a Vertex AI Workbench environment.
+You can execute the diagnostic suite using any of three methods, ranging from zero-install single-file execution to standard editable python package installs:
 
-### Option A: External Terminal / Cloud Shell / Local Workstation
+### Option A: Zero-Install Standalone Executable (`.pyz`) (Recommended / Fastest)
+
+The entire diagnostic tool is packaged as a single-file executable Python zipapp (`dataproc_gateway_diagnostics.pyz`). It requires **zero package installations, zero compilers, and zero virtual environments** — only Python 3.8+ (which is pre-installed on Vertex AI Workbench VMs, Cloud Shell, Cloudtop, and standard Linux workstations):
+
+```bash
+# 1. Download or copy the single standalone binary
+curl -sLO https://raw.githubusercontent.com/Royston88/gcp-workbench-gateway-diagnostics-tool/main/dataproc_gateway_diagnostics.pyz
+
+# 2. Run directly with Python (outside or inside Workbench)
+python3 dataproc_gateway_diagnostics.pyz diagnose \
+    --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+```
+
+### Option B: Local Git Clone / Pip Install
 
 ```bash
 git clone https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool.git
@@ -128,7 +141,7 @@ cd gcp-workbench-gateway-diagnostics-tool
 pip install --no-deps -e .
 ```
 
-### Option B: Vertex AI Workbench (Notebook Cell or Terminal)
+### Option C: In-Situ Vertex AI Workbench (Notebook Cell or Terminal)
 
 Run this directly **in a notebook cell**:
 
@@ -141,7 +154,18 @@ import sys
 > [!IMPORTANT]
 > When installing inside Workbench notebooks, use `{sys.executable}`, not a bare `pip`. On Vertex AI Workbench the JupyterLab **server** runs in `/opt/micromamba/envs/jupyterlab` while the notebook **kernel** runs `/opt/micromamba/bin/python3`. A bare `pip install` frequently targets the server environment, and the tool then fails inside cells with `FileNotFoundError: 'gateway-diag'`. `{sys.executable}` always resolves to the interpreter actually executing your cell.
 
-`--no-deps` guarantees pip cannot upgrade, downgrade, or overwrite any existing Google Cloud library. The package has a single dependency, `google-auth`, already present in modern Google Cloud environments.
+### Option D: Direct In-Cluster PySpark Probe (Zero-Download Air-Gapped Fallback)
+
+If running from an air-gapped environment or locked-down jumpbox where downloading binaries or installing packages is restricted, you can submit the standalone probe script directly through `gcloud`:
+
+```bash
+gcloud dataproc jobs submit pyspark scripts/probe_yarn_metrics.py \
+    --cluster=<CLUSTER> \
+    --region=<REGION> \
+    --properties=spark.master=local[1]
+```
+
+This bypasses Component Gateway HTTPS entirely and collects YARN RM metrics, CapacityScheduler limits, active/queued apps, local Kernel Gateway sessions, and gateway logs directly from the master VM loopback.
 
 ---
 
@@ -152,11 +176,11 @@ import sys
 Run from an external terminal, Cloud Shell, Cloudtop, or CI/CD to inspect all cluster sessions, cross-VM disambiguation signals, and multi-tenant AM allocation:
 
 ```bash
-# Using the console script directly:
-gateway-diag diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+# Using the standalone .pyz binary:
+python3 dataproc_gateway_diagnostics.pyz diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 
-# Or via Python module:
-python3 -m dataproc_gateway_diagnostics diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+# Or via installed console script:
+gateway-diag diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 ```
 
 ### Option B: Regular Data Scientist (Personal Scoped Audit)
@@ -168,10 +192,20 @@ import sys
 PY = sys.executable
 
 # Personal scoped diagnosis (zero peer noise, zero permission errors):
-!{PY} -m dataproc_gateway_diagnostics diagnose \
+!{PY} dataproc_gateway_diagnostics.pyz diagnose \
     --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER> \
     --my-sessions-only
 ```
+
+### Transport Modes (`--transport`)
+
+The tool supports three diagnostic transport mechanisms:
+
+| Flag Value | Mode | Description |
+|---|---|---|
+| `--transport=auto` *(default)* | **Hybrid Auto-Fallback** | Attempts Method 1 (Component Gateway HTTPS). If Component Gateway is unreachable (`[Errno 101] Network is unreachable`, air-gapped private VPC lacking Anycast VIP route, or Knox `HTTP 500 Service connectivity error`), automatically falls back to Method 2. |
+| `--transport=gateway` | **Component Gateway HTTPS** | Queries reverse-proxy endpoints (`https://<hash>.dataproc.googleusercontent.com/...`) for Kernel Gateway and YARN RM. |
+| `--transport=spark-job` | **In-Cluster PySpark Job** | Submits a single non-intrusive `spark.master=local[1]` PySpark job to query master-local loopback endpoints (`127.0.0.1:8888`, `https://localhost:8090`, and `/var/log/jupyter_kernel_gateway.log`) in ~10 seconds. |
 
 > [!TIP]
 > Run it **while the problem is occurring**. Checks 1 and 2 read live YARN state; on an idle cluster they will legitimately pass even if the cluster fails under load.
@@ -188,15 +222,25 @@ Tool Version   : 0.2.0
 Target Cluster : pyspark-cluster-dev-multitenant
 Cluster State  : RUNNING
 Image Version  : 2.3.36-debian12
+Transport Mode : Method 1: Component Gateway HTTPS
 -----------------------------------------------------------------
 
 [CHECK 2] YARN ApplicationMaster Capacity
-   -> maximum-am-resource-percent   : 0.8 (recommended >= 0.8)
-   -> AM memory used / limit        : 0 MB / 41.3 GB  (0.0%)
+   -> Scheduler                     : capacityScheduler
+   -> Queue examined                : default (capacity: 100.0%, absolute: 100.0%)
+   -> maximum-am-resource-percent   : 80.0% (0.8) (recommended >= 80.0% / 0.8)
+   -> AM memory used / limit        : 0 MB / 41.3 GB (42317 MB)  (0.0%)
+   -> User AM resource limit        : 41.3 GB (42317 MB)
    -> Applications ACTIVE           : 0
    -> Applications PENDING (ACCEPTED): 0
-   -> Cluster memory                : 0 MB used / 51.7 GB total  (51.7 GB free)
+   -> Queued App Diagnostics        : None (no applications currently queued in ACCEPTED)
+   -> Active queue user(s)          : None (0 active users in queue)
+   -> Cluster memory                : 0 MB used / 51.7 GB (52896 MB) total  (51.7 GB (52896 MB) free)
+   -> maxApplications / per user    : 10000 / 10000
+   -> userLimitFactor               : 1.0
    -> Verdict                       : [✓] PASS
+      ApplicationMaster budget 0.0% consumed, 0 application(s)
+      pending. No starvation detected.
 
 =================================================================
                              SUMMARY
@@ -220,17 +264,21 @@ Exit code `0`. All four causes ruled out — look elsewhere (networking, image, 
 ```
 [CHECK 2] YARN ApplicationMaster Capacity
    -> Scheduler                     : capacityScheduler
-   -> Queue examined                : default
-   -> maximum-am-resource-percent   : 0.1 (recommended >= 0.8)
-   -> AM memory used / limit        : 2.4 GB / 2.5 GB  (96.3%)
+   -> Queue examined                : default (capacity: 100.0%, absolute: 100.0%)
+   -> maximum-am-resource-percent   : 10.0% (0.1) (recommended >= 80.0% / 0.8)
+   -> AM memory used / limit        : 2.4 GB (2458 MB) / 2.5 GB (2560 MB)  (96.0%)
+   -> User AM resource limit        : 2.5 GB (2560 MB)
    -> Applications ACTIVE           : 1
    -> Applications PENDING (ACCEPTED): 5
-   -> Active queue user(s)          : ds-user-1-svc (1 app(s), AM: 2.4 GB)
-   -> Cluster memory                : 8.5 GB used / 24.7 GB total  (16.1 GB free)
+   -> Queued App Diagnostics        :
+      * App [1] application_1727654321_0002 (user: ds_user_2):
+        YARN Diagnostics: Application is added to the scheduler and is not yet activated. Queue's AM resource limit exceeded.
+   -> Active queue user(s)          : ds-user-1-svc (1 active, 0 pending, AM: 2.4 GB (2458 MB)), ds-user-2-svc (0 active, 5 pending, AM: 0 MB)
+   -> Cluster memory                : 8.5 GB (8704 MB) used / 24.7 GB (25292 MB) total  (16.1 GB (16588 MB) free)
    -> Verdict                       : [✗] FAIL
       AM STARVATION CONFIRMED: applications are queued in
-      ACCEPTED while 16.1 GB of cluster memory is still free. The
-      ApplicationMaster budget is 96.3% consumed.
+      ACCEPTED while 16.1 GB (16588 MB) of cluster memory is still free. The
+      ApplicationMaster budget is 96.0% consumed.
 
 =================================================================
    Check 2  YARN ApplicationMaster Capacity  : [✗] FAIL   <-- PRIMARY ROOT CAUSE
