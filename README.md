@@ -531,14 +531,56 @@ gateway-diag diagnose --cluster=<CLUSTER> --json > gateway_audit.json
 
 ---
 
-## Troubleshooting
+## Troubleshooting & Known Operational Errors
 
-| Symptom | Cause | Fix |
+### Quick Diagnostic Matrix
+
+| Symptom | Primary Cause | Immediate Fix |
 |---|---|---|
-| `FileNotFoundError: 'gateway-diag'` | Installed into a different environment than the kernel | Reinstall with `{sys.executable}` (Step 2) |
-| `[?] SKIPPED` on Checks 1/2 | Component Gateway disabled, or missing `dataproc.clusters.use` | Verify Step 1; grant the role the tool prints |
-| `[?] SKIPPED` on Check 3 | Missing `roles/logging.viewer` | Grant it, or ignore — Check 3 is corroborating only |
-| Everything passes but kernels still fail | Run happened while the cluster was idle | Re-run **during** the failure |
+| **`[Errno 101] Network is unreachable`**<br>`Network error for https://<hash>.dataproc.googleusercontent.com/...` | Private/air-gapped VPC lacks routes for public Anycast IPs used by `*.dataproc.googleusercontent.com` | **Use `--transport=auto` (default)** or `--transport=spark-job` to read master loopback via in-cluster PySpark job; or add Cloud DNS Private Zone for `dataproc.googleusercontent.com.` (see details below). |
+| **Check 3 `[?] SKIPPED`**<br>`Request is prohibited by organization's policy. vpcServiceControlsUniqueIdentifier: ...` | VPC Service Controls (VPC-SC) blocks `logging.googleapis.com` from the executing identity | **Use `--transport=auto`** (auto-falls back to master `/var/log/jupyter_kernel_gateway.log`), or submit `scripts/probe_yarn_metrics.py` directly via `gcloud`. |
+| **`pip install` fails offline**<br>`Could not find a version that satisfies the requirement` | Locked-down / air-gapped Workbench VM without public PyPI egress | **Use the standalone `.pyz` binary** (`dataproc_gateway_diagnostics.pyz`) or `scripts/probe_yarn_metrics.py`. Neither requires `pip install`. |
+| **`HTTP 500 Service connectivity error`**<br>`java.io.IOException: Service connectivity error` from Knox | Component Gateway's Knox reverse-proxy lost transient connection to YARN RM | **Use `--transport=auto`** to query YARN RM directly on the master node loopback (`https://localhost:8090`). |
+| **`FileNotFoundError: 'gateway-diag'`** in notebook cell | `pip` installed the package into the JupyterLab server env rather than the notebook kernel env | Reinstall using `{sys.executable} -m pip install --no-deps -e ...` (see Step 2 Option C), or execute the standalone `.pyz` directly. |
+| **`[?] SKIPPED` on Checks 1 and 2** | Component Gateway disabled, or caller lacks `dataproc.clusters.use` | Verify Step 1 (`enableHttpPortAccess: True`); grant `roles/dataproc.editor` or custom `DataprocGatewayUser` role. |
+| **All checks pass, but kernels still fail** | Diagnostic was executed while the cluster was idle | Re-run the diagnostic **during peak hours while kernel launch failures are actively occurring**. Live YARN state resets once orphaned drivers are killed or cluster restarts. |
+
+---
+
+### Deep Dive: Resolving Air-Gapped VPC & Private Google Access Errors
+
+#### 1. `[Errno 101] Network is unreachable` on Component Gateway (`*.dataproc.googleusercontent.com`)
+
+**The Root Cause:**  
+On private Google Cloud VPCs without Cloud NAT or internet gateways, standard Private Google Access (PGA) only resolves and routes Google API domains (`*.googleapis.com`). Dataproc Component Gateway URLs reside under `*.dataproc.googleusercontent.com`, which resolves to public Anycast IPs (`173.194.206.132` / `34.x.x.x`). Because private subnets lack a `0.0.0.0/0` default internet gateway route, connection attempts from Workbench VMs immediately fail with `[Errno 101] Network is unreachable`.
+
+**Resolution Options:**
+* **Option A (Zero Infrastructure Change — Tool v0.2.0+):**  
+  Execute the diagnostic tool using `--transport=auto` (default) or `--transport=spark-job`. The tool automatically catches `[Errno 101]` and routes through an in-cluster PySpark job (`spark.master=local[1]`) that reads master loopback `127.0.0.1:8888` and `https://localhost:8090` without touching Component Gateway.
+* **Option B (Permanent VPC Route / DNS Fix for Interactive Notebooks):**  
+  If interactive JupyterLab notebooks must connect to remote Dataproc kernels via Component Gateway from this private VPC, configure Cloud DNS and routing for the Restricted VIP:
+  1. Create a **Cloud DNS Private Zone** for `dataproc.googleusercontent.com.` in your VPC.
+  2. Add a wildcard CNAME record: `*.dataproc.googleusercontent.com.` -> `restricted.googleapis.com.` (or `private.googleapis.com.`).
+  3. Ensure a custom route exists in your VPC routing `199.36.153.4/30` (Restricted VIP) to the `default-internet-gateway` next hop.
+* **Option C (Subshell Proxy Inheritance):**  
+  If your Workbench VM accesses external endpoints through an enterprise HTTP proxy, notebook cell bash subshells (`!`) do not automatically inherit shell environment variables. Run:
+  ```bash
+  !https_proxy=$https_proxy http_proxy=$http_proxy python3 dataproc_gateway_diagnostics.pyz diagnose --cluster=<CLUSTER>
+  ```
+
+#### 2. VPC Service Controls (VPC-SC) Blocking Cloud Logging (Check 3)
+
+**The Root Cause:**  
+Enterprise financial perimeters (such as DBS Bank) enforce VPC Service Controls on `logging.googleapis.com`. When the diagnostic tool attempts to query Cloud Logging via `entries:list` from a Workbench VM whose service account lacks perimeter ingress authorization, Google's API gateway rejects the call:
+```text
+HTTP 403: Request is prohibited by organization's policy. vpcServiceControlsUniqueIdentifier: G6u-...
+```
+
+**Resolution Options:**
+* **Option A (In-Cluster Log Fallback — Tool v0.2.0+):**  
+  When `--transport=auto` or `--transport=spark-job` is active, the tool catches the VPC-SC HTTP 403 error and automatically falls back to inspecting the master VM's physical log file (`/var/log/jupyter_kernel_gateway.log`), extracting launch timeout exceptions directly.
+* **Option B (Air-Gapped Standalone Script):**  
+  Submit `scripts/probe_yarn_metrics.py` directly via `gcloud dataproc jobs submit pyspark`. Section 5 reads `/var/log/jupyter_kernel_gateway.log` with zero Cloud Logging API calls.
 
 ---
 
