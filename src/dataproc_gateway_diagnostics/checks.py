@@ -1056,10 +1056,26 @@ def check_am_capacity(
                 f"Queued App [{idx}]",
                 f"{acc['id']} (User: {acc['user']} | Name: {acc['name']} | State: {acc['state']})",
             )
+            raw_diag = acc["diagnostics"] or "No diagnostic message reported by YARN RM"
             result.add(
                 "  * YARN Diagnostics",
-                acc["diagnostics"] or "No diagnostic message reported by YARN RM",
+                raw_diag,
             )
+            diag_lower = raw_diag.lower()
+            if "waiting for am container to register with rm" in diag_lower:
+                result.add(
+                    "  * Root Cause Diagnosis",
+                    "AM container process was successfully launched on worker node, but the Spark driver JVM has not "
+                    "yet registered back with ResourceManager. If JVM initialization takes >120s (e.g. OpenTelemetry bytecode "
+                    "instrumentation or classloading delays), Kernel Gateway aborts with HTTP 500 'Error Starting Kernel'. "
+                    "Remediation: increase GatewayProvisionerBase.default_kernel_launch_timeout=600.",
+                )
+            elif "am resource limit exceeded" in diag_lower:
+                result.add(
+                    "  * Root Cause Diagnosis",
+                    "Queue AM capacity starvation: YARN cannot allocate the driver container because maximum-am-resource-percent "
+                    "is exhausted. Remediation: increase maximum-am-resource-percent to 0.8.",
+                )
     else:
         result.add(
             "Queued App Diagnostics",

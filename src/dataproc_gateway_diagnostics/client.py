@@ -140,7 +140,7 @@ try:
             entries = []
             ts_re = re.compile(r"^\\[[IWEFD]\\s+(\\d{2})(\\d{2})(\\d{2})\\s+(\\d{2}:\\d{2}:\\d{2})")
             for line in f:
-                if "launch timeout" in line:
+                if any(w in line.lower() for w in ("launch timeout", "timeouterror", "500 post /api/kernels", "error starting kernel", "failed to start kernel")):
                     m_ts = ts_re.match(line)
                     if m_ts:
                         yy, mm, dd, hms = m_ts.groups()
