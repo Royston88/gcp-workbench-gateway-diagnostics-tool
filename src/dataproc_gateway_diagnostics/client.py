@@ -24,6 +24,7 @@ Design constraints
 """
 
 import datetime
+import errno
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -54,6 +56,10 @@ import json
 import os
 import re
 
+# Security note: YARN ResourceManager on Dataproc uses self-signed SSL certificates
+# when yarn.http.policy = HTTPS_ONLY. Because this probe runs strictly on the master VM
+# and connects exclusively to local loopback (localhost:8090), disabling certificate
+# verification is safe and necessary to prevent SSL handshake errors on loopback.
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
@@ -305,7 +311,9 @@ class GatewayDiagnosticClient:
         region: Optional[str] = None,
         timeout: int = 30,
         verbose: bool = False,
-        transport: str = "auto",
+        transport: str = "gateway",
+        allow_job_submission: bool = False,
+        billing_project: Optional[str] = None,
     ):
         if verbose:
             logging.basicConfig(level=logging.INFO)
@@ -316,7 +324,12 @@ class GatewayDiagnosticClient:
         self.timeout = timeout
         self.active_account = resolve_active_account()
         self.transport = (
-            transport if transport in ("auto", "gateway", "spark-job") else "auto"
+            transport if transport in ("auto", "gateway", "spark-job") else "gateway"
+        )
+        self.allow_job_submission = allow_job_submission
+        self.billing_project = billing_project or (
+            os.environ.get("CLOUDSDK_CORE_BILLING_PROJECT")
+            or os.environ.get("GOOGLE_CLOUD_USER_PROJECT")
         )
         self.active_transport = (
             "Method 2: In-Cluster PySpark Job (spark.master=local[1])"
@@ -344,19 +357,65 @@ class GatewayDiagnosticClient:
 
     @staticmethod
     def _is_network_error(exc: Exception) -> bool:
+        """Determines if an exception is a connection-level network failure (e.g. ENETUNREACH, ECONNREFUSED, DNS)."""
+        target = exc
+        if hasattr(exc, "__cause__") and exc.__cause__:
+            target = exc.__cause__
+
+        if isinstance(target, urllib.error.URLError):
+            reason = target.reason
+            if isinstance(reason, socket.gaierror):
+                return True
+            if isinstance(reason, OSError) and reason.errno in (
+                errno.ENETUNREACH,
+                errno.ECONNREFUSED,
+                errno.EHOSTUNREACH,
+                errno.ETIMEDOUT,
+            ):
+                return True
+            rstr = str(reason).lower()
+            if "errno 101" in rstr or "network is unreachable" in rstr or "connection refused" in rstr:
+                return True
+
+        if isinstance(target, OSError) and target.errno in (
+            errno.ENETUNREACH,
+            errno.ECONNREFUSED,
+            errno.EHOSTUNREACH,
+            errno.ETIMEDOUT,
+        ):
+            return True
+
         msg = str(exc).lower()
-        return (
-            "network error for " in msg
-            or "errno 101" in msg
-            or "unreachable" in msg
-            or "timed out" in msg
-            or "name or service not known" in msg
+        if (
+            "errno 101" in msg
+            or "network is unreachable" in msg
             or "connection refused" in msg
-            or "service connectivity error" in msg
-            or "http 502" in msg
-            or "http 503" in msg
-            or "http 504" in msg
-        )
+            or "name or service not known" in msg
+        ):
+            return True
+
+        return False
+
+    def _handle_gateway_fallback(self, exc: Exception, action_name: str) -> None:
+        """Determines whether to fall back to an in-cluster PySpark job or raise guidance."""
+        if self._is_network_error(exc):
+            self._gateway_unreachable = True
+            if self.transport == "spark-job" or (
+                self.transport == "auto" and self.allow_job_submission
+            ):
+                return
+            hint_flag = (
+                "--transport=spark-job"
+                if self.transport == "gateway"
+                else "--allow-job-submission"
+            )
+            raise DiagnosticError(
+                f"Component Gateway is unreachable over the network ([Errno 101] ENETUNREACH / connection failure).\n"
+                f"The tool operates in read-only mode by default and does not submit cluster jobs without permission.\n"
+                f"To collect diagnostic data directly on the master VM via an in-cluster PySpark job (requires dataproc.jobs.create), run:\n"
+                f"  gateway-diag {self.cluster_name} --project={self.project_id} --region={self.region} {hint_flag}"
+            ) from exc
+        raise exc
 
     def _get_master_snapshot(self) -> Dict[str, Any]:
         """Collects master-local Kernel Gateway, YARN RM, and Gateway logs via a single local[1] PySpark job."""
@@ -368,6 +427,8 @@ class GatewayDiagnosticClient:
             self.cluster_name,
         )
         temp_path: Optional[str] = None
+        job_id: Optional[str] = None
+        timeout_seconds = max(120, self.timeout * 4)
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix="_gateway_diag_probe.py", delete=False
@@ -375,7 +436,12 @@ class GatewayDiagnosticClient:
                 tf.write(MASTER_COLLECTOR_SCRIPT)
                 temp_path = tf.name
 
-            cmd = [
+            env = os.environ.copy()
+            env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+            if self._token:
+                env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = self._token
+
+            submit_cmd = [
                 "gcloud",
                 "dataproc",
                 "jobs",
@@ -386,23 +452,64 @@ class GatewayDiagnosticClient:
                 f"--region={self.region}",
                 f"--project={self.project_id}",
                 "--properties=spark.master=local[1]",
-                "--quiet",
+                "--labels=tool=gateway-diag",
+                "--async",
+                "--format=value(reference.jobId)",
             ]
-            env = os.environ.copy()
-            env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
-            if self._token:
-                env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = self._token
-            out = subprocess.run(
-                cmd,
+            submit_res = subprocess.run(
+                submit_cmd,
                 capture_output=True,
                 text=True,
                 env=env,
-                timeout=max(120, self.timeout * 4),
+                timeout=30,
+                check=False,
+            )
+            if submit_res.returncode != 0:
+                err_msg = (submit_res.stderr or submit_res.stdout or "Job submission failed").strip()
+                raise DiagnosticError(f"Failed to submit in-cluster PySpark diagnostic job: {err_msg}")
+
+            job_id = submit_res.stdout.strip()
+            if not job_id:
+                match = re.search(r"Job\s+\[([a-zA-Z0-9_\-]+)\]\s+submitted", submit_res.stderr or "")
+                if match:
+                    job_id = match.group(1)
+
+            if not job_id:
+                raise DiagnosticError("Failed to determine submitted Dataproc job ID from gcloud output.")
+
+            wait_cmd = [
+                "gcloud",
+                "dataproc",
+                "jobs",
+                "wait",
+                job_id,
+                f"--region={self.region}",
+                f"--project={self.project_id}",
+            ]
+            out = subprocess.run(
+                wait_cmd,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=timeout_seconds,
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
+            if job_id:
+                logger.warning("Job %s timed out after %ds; killing on cluster...", job_id, timeout_seconds)
+                kill_cmd = [
+                    "gcloud",
+                    "dataproc",
+                    "jobs",
+                    "kill",
+                    job_id,
+                    f"--region={self.region}",
+                    f"--project={self.project_id}",
+                    "--quiet",
+                ]
+                subprocess.run(kill_cmd, env=env, capture_output=True, check=False)
             raise DiagnosticError(
-                "In-cluster PySpark diagnostic job timed out while waiting for Dataproc agent."
+                f"In-cluster PySpark diagnostic job (ID: {job_id or 'unknown'}) timed out after {timeout_seconds}s and was killed on the cluster."
             ) from exc
         except OSError as exc:
             raise DiagnosticError(
@@ -441,6 +548,7 @@ class GatewayDiagnosticClient:
                     f"Failed to parse master snapshot JSON from PySpark job: {exc}"
                 ) from exc
 
+
         err_text = (out.stderr or out.stdout or "Unknown error").strip()
         if "403" in err_text or "Permission" in err_text or "does not have" in err_text:
             raise AccessDenied(
@@ -475,8 +583,8 @@ class GatewayDiagnosticClient:
 
     def _request(self, url: str, payload: Optional[Dict[str, Any]] = None) -> Any:
         headers: Dict[str, str] = {"Authorization": f"Bearer {self._token}"}
-        if "googleapis.com" in url and self.project_id:
-            headers["X-Goog-User-Project"] = self.project_id
+        if "googleapis.com" in url and self.billing_project:
+            headers["X-Goog-User-Project"] = self.billing_project
         if payload is None:
             req = urllib.request.Request(url, headers=headers)
             logger.info("GET %s", url)
@@ -490,29 +598,44 @@ class GatewayDiagnosticClient:
             )
             logger.info("POST %s", url)
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = self._describe_http_error(exc)
-            if exc.code in (401, 403):
-                roles = ["roles/dataproc.viewer"]
-                if "dataproc.googleusercontent.com" in url:
-                    roles = ["roles/dataproc.viewer", "dataproc.clusters.use"]
-                elif "logging.googleapis.com" in url:
-                    roles = ["roles/logging.viewer"]
-                elif "compute.googleapis.com" in url:
-                    roles = ["roles/compute.viewer"]
-                elif "monitoring.googleapis.com" in url:
-                    roles = ["roles/monitoring.viewer"]
-                elif "notebooks.googleapis.com" in url:
-                    roles = ["roles/notebooks.viewer"]
-                raise AccessDenied(detail, required_roles=roles) from exc
-            if exc.code == 404:
-                raise NotFound(detail) from exc
-            raise DiagnosticError(f"HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise DiagnosticError(f"Network error for {url}: {exc.reason}") from exc
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                if exc.code in (502, 503, 504) and attempt < max_retries:
+                    logger.warning("HTTP %d from %s; retrying (attempt %d/%d)...", exc.code, url, attempt + 1, max_retries)
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                detail = self._describe_http_error(exc)
+                if exc.code in (401, 403):
+                    detail_lower = detail.lower()
+                    if (
+                        "organization's policy" in detail_lower
+                        or "vpcservicecontrols" in detail_lower
+                        or "securitypolicyviolated" in detail_lower
+                    ):
+                        raise DiagnosticError(
+                            f"HTTP {exc.code} (VPC Service Controls): {detail}"
+                        ) from exc
+                    roles = ["roles/dataproc.viewer"]
+                    if "dataproc.googleusercontent.com" in url:
+                        roles = ["roles/dataproc.viewer", "dataproc.clusters.use"]
+                    elif "logging.googleapis.com" in url:
+                        roles = ["roles/logging.viewer"]
+                    elif "compute.googleapis.com" in url:
+                        roles = ["roles/compute.viewer"]
+                    elif "monitoring.googleapis.com" in url:
+                        roles = ["roles/monitoring.viewer"]
+                    elif "notebooks.googleapis.com" in url:
+                        roles = ["roles/notebooks.viewer"]
+                    raise AccessDenied(detail, required_roles=roles) from exc
+                if exc.code == 404:
+                    raise NotFound(detail) from exc
+                raise DiagnosticError(f"HTTP {exc.code}: {detail}") from exc
+            except urllib.error.URLError as exc:
+                raise DiagnosticError(f"Network error for {url}: {exc.reason}") from exc
 
     def _get_json(self, url: str) -> Any:
         return self._request(url)
@@ -589,8 +712,8 @@ class GatewayDiagnosticClient:
         try:
             return self.yarn("ws/v1/cluster/metrics").get("clusterMetrics", {})
         except DiagnosticError as exc:
-            if self.transport == "auto" and self._is_network_error(exc):
-                self._gateway_unreachable = True
+            if self._is_network_error(exc):
+                self._handle_gateway_fallback(exc, "yarn_metrics")
                 return self._get_master_snapshot().get("yarn_metrics", {})
             raise
 
@@ -605,8 +728,8 @@ class GatewayDiagnosticClient:
                 "schedulerInfo", {}
             )
         except DiagnosticError as exc:
-            if self.transport == "auto" and self._is_network_error(exc):
-                self._gateway_unreachable = True
+            if self._is_network_error(exc):
+                self._handle_gateway_fallback(exc, "yarn_scheduler")
                 return self._get_master_snapshot().get("yarn_scheduler", {})
             raise
 
@@ -621,8 +744,8 @@ class GatewayDiagnosticClient:
         try:
             data = self.yarn(f"ws/v1/cluster/apps?states={urllib.parse.quote(states)}")
         except DiagnosticError as exc:
-            if self.transport == "auto" and self._is_network_error(exc):
-                self._gateway_unreachable = True
+            if self._is_network_error(exc):
+                self._handle_gateway_fallback(exc, "yarn_apps")
                 raw_apps = self._get_master_snapshot().get("yarn_apps", []) or []
                 if states:
                     allowed = {s.strip().upper() for s in states.split(",") if s.strip()}
@@ -661,8 +784,8 @@ class GatewayDiagnosticClient:
             data = self._get_json(f"{base}/api/kernels")
             return data if isinstance(data, list) else []
         except DiagnosticError as exc:
-            if self.transport == "auto" and self._is_network_error(exc):
-                self._gateway_unreachable = True
+            if self._is_network_error(exc):
+                self._handle_gateway_fallback(exc, "kernels")
                 return self._get_master_snapshot().get("kernels", [])
             raise
 
@@ -970,7 +1093,6 @@ class GatewayDiagnosticClient:
                 context["zone"] = zone
                 zone_str = f", Zone: {zone}" if zone else ""
                 context["display"] = f"Vertex AI Workbench Instance (In Situ: {vm_name}{zone_str})"
-                return context
             else:
                 context["is_in_situ"] = False
                 context["environment"] = "External GCE VM"
@@ -980,23 +1102,37 @@ class GatewayDiagnosticClient:
                 context["zone"] = zone
                 zone_str = f", Zone: {zone}" if zone else ""
                 context["display"] = f"External GCE VM (Outside Workbench: {vm_name}{zone_str})"
-                return context
-
-        # Step B: Fallback to workstation hostname
-        try:
-            fqdn = socket.getfqdn()
-            hostname = fqdn or socket.gethostname() or platform.node()
-        except Exception:
-            hostname = "localhost"
-
-        context["is_in_situ"] = False
-        context["host"] = hostname
-        if ".c.googlers.com" in hostname or "cloudtop" in hostname:
-            context["environment"] = "Cloudtop Workstation"
-            context["display"] = f"External Workstation (Outside Workbench: {hostname})"
         else:
-            context["environment"] = "External Workstation"
-            context["display"] = f"External Workstation (Outside Workbench: {hostname})"
+            # Step B: Fallback to workstation hostname
+            try:
+                fqdn = socket.getfqdn()
+                hostname = fqdn or socket.gethostname() or platform.node()
+            except Exception:
+                hostname = "localhost"
+
+            context["is_in_situ"] = False
+            context["host"] = hostname
+            if ".c.googlers.com" in hostname or "cloudtop" in hostname:
+                context["environment"] = "Cloudtop Workstation"
+                context["display"] = f"External Workstation (Outside Workbench: {hostname})"
+            else:
+                context["environment"] = "External Workstation"
+                context["display"] = f"External Workstation (Outside Workbench: {hostname})"
+
+        # Step C: Inspect proxy environment variables
+        proxy_parts = []
+        https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        if https_proxy:
+            proxy_parts.append(f"HTTPS_PROXY={https_proxy}")
+        http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        if http_proxy:
+            proxy_parts.append(f"HTTP_PROXY={http_proxy}")
+        no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
+        if no_proxy:
+            proxy_parts.append(f"NO_PROXY={no_proxy}")
+        if proxy_parts:
+            context["proxy_env"] = ", ".join(proxy_parts)
+            context["display"] += f" [{context['proxy_env']}]"
 
         return context
 
@@ -1332,7 +1468,13 @@ class GatewayDiagnosticClient:
             data = self._post_json(f"{LOGGING_API}/entries:list", payload)
             return data.get("entries", []) or []
         except (AccessDenied, DiagnosticError) as exc:
-            if is_gateway_timeout_query and self.transport in ("auto", "spark-job"):
+            if (
+                is_gateway_timeout_query
+                and (
+                    self.transport == "spark-job"
+                    or (self.transport == "auto" and self.allow_job_submission)
+                )
+            ):
                 logger.info(
                     "Cloud Logging unavailable for Check 3 (%s); falling back to master local /var/log/jupyter_kernel_gateway.log via Method 2 Spark job",
                     exc,

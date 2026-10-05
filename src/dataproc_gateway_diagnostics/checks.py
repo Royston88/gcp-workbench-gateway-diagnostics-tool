@@ -896,26 +896,37 @@ def check_am_capacity(
         limit_am = _resource_mb(queue.get("AMResourceLimit")) or 0
         saturation = (used_am / limit_am) if limit_am else 0.0
 
-        partition_caps = (
-            (queue.get("capacities") or {}).get("queueCapacitiesByPartition") or [{}]
-        )[0]
+        # Select default partition (partitionName == "") or fall back to first entry
+        partitions = (queue.get("capacities") or {}).get("queueCapacitiesByPartition") or []
+        partition_caps: Dict[str, Any] = {}
+        for p in partitions:
+            if p.get("partitionName") == "":
+                partition_caps = p
+                break
+        if not partition_caps and partitions:
+            partition_caps = partitions[0]
+
         raw_part_am = partition_caps.get("maxAMLimitPercentage")
         raw_conf_am = queue.get("configuredMaxAMResourceLimit")
         max_am_pct: Optional[float] = None
         max_am_ratio: Optional[float] = None
-        for cand_val in (raw_part_am, raw_conf_am):
-            if cand_val is not None:
-                try:
-                    fval = float(cand_val)
-                    if fval > 1.0:
-                        max_am_pct = fval
-                        max_am_ratio = round(fval / 100.0, 4)
-                    else:
-                        max_am_ratio = fval
-                        max_am_pct = round(fval * 100.0, 2)
-                    break
-                except (ValueError, TypeError):
-                    pass
+
+        if raw_part_am is not None:
+            try:
+                # maxAMLimitPercentage is always a percentage (e.g. 1.0 means 1%, 80.0 means 80%)
+                fval = float(raw_part_am)
+                max_am_pct = fval
+                max_am_ratio = round(fval / 100.0, 4)
+            except (ValueError, TypeError):
+                pass
+        elif raw_conf_am is not None:
+            try:
+                # configuredMaxAMResourceLimit is always a ratio (e.g. 0.01 means 1%, 0.8 means 80%)
+                fval = float(raw_conf_am)
+                max_am_ratio = fval
+                max_am_pct = round(fval * 100.0, 2)
+            except (ValueError, TypeError):
+                pass
 
         row = {
             "queue": queue.get("queueName", "?"),
@@ -1167,6 +1178,8 @@ def check_am_capacity(
 def check_launch_timeouts(
     client: GatewayDiagnosticClient,
     lookback_days: int = DEFAULT_TIMEOUT_LOOKBACK_DAYS,
+    my_sessions_only: bool = False,
+    scoped_user: Optional[str] = None,
 ) -> CheckResult:
     name = "Kernel Gateway Launch Timeouts"
     result = CheckResult(check_id=3, name=name)
@@ -1212,7 +1225,12 @@ def check_launch_timeouts(
             timeout_values.append(int(found.group(1)))
         kernel = re.search(r"KernelID:\s*'([^']+)'", text)
         if kernel:
-            kernel_ids.append(kernel.group(1))
+            k_id = kernel.group(1)
+            # If peer masking active, mask kernel ID if not caller's
+            if my_sessions_only and scoped_user:
+                kernel_ids.append(f"{k_id[:8]}...[masked]")
+            else:
+                kernel_ids.append(k_id)
 
     effective_timeout = max(set(timeout_values), key=timeout_values.count) if timeout_values else None
     unique_kernels = sorted(set(kernel_ids))
@@ -1389,7 +1407,12 @@ def run_checks(
             my_sessions_only=my_sessions_only,
             scoped_user=scoped_user,
         ),
-        3: lambda: check_launch_timeouts(client, lookback_days),
+        3: lambda: check_launch_timeouts(
+            client,
+            lookback_days=lookback_days,
+            my_sessions_only=my_sessions_only,
+            scoped_user=scoped_user,
+        ),
         4: lambda: check_driver_sizing(client, expected_users),
     }
     names = {

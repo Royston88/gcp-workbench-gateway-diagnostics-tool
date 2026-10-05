@@ -253,7 +253,10 @@ def render_text(report: GatewayDiagnosticReport) -> str:
                 step += 1
         lines.append(RULE)
     else:
-        lines.append(_center("No action required."))
+        if report.overall_status in (Status.ERROR, Status.SKIPPED):
+            lines.append(_center("Review error details above."))
+        else:
+            lines.append(_center("No action required."))
         lines.append(RULE)
 
     return "\n".join(lines)
@@ -369,13 +372,28 @@ Examples:
     )
     parser.add_argument(
         "--transport",
-        default="auto",
-        choices=["auto", "gateway", "spark-job"],
+        default="gateway",
+        choices=["gateway", "auto", "spark-job"],
         help=(
-            "Data collection transport: 'gateway' (Method 1 Component Gateway HTTPS), "
+            "Data collection transport: 'gateway' (default: Method 1 Component Gateway HTTPS), "
             "'spark-job' (Method 2 In-Cluster PySpark local[1] job), or 'auto' "
-            "(Method 1 with automatic fallback to Method 2 if Component Gateway is unreachable)."
+            "(Method 1 with optional automatic fallback to Method 2 if --allow-job-submission is set)."
         ),
+    )
+    parser.add_argument(
+        "--allow-job-submission",
+        action="store_true",
+        help=(
+            "Allow automatic in-cluster PySpark job submission fallback when Component Gateway is unreachable. "
+            "Note: job submission is a write action requiring dataproc.jobs.create and leaves a job history trace."
+        ),
+    )
+    parser.add_argument(
+        "--billing-project",
+        "--user-project",
+        dest="billing_project",
+        default=None,
+        help="Google Cloud project ID to bill for Cloud API calls via the X-Goog-User-Project header.",
     )
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds.")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
@@ -400,6 +418,8 @@ Examples:
             timeout=args.timeout,
             verbose=args.verbose,
             transport=args.transport,
+            allow_job_submission=args.allow_job_submission,
+            billing_project=args.billing_project,
         )
         report = build_report(
             client,
