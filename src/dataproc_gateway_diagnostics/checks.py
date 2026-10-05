@@ -1226,7 +1226,8 @@ def check_launch_timeouts(
         kernel = re.search(r"KernelID:\s*'([^']+)'", text)
         if kernel:
             k_id = kernel.group(1)
-            # If peer masking active, mask kernel ID if not caller's
+            # Under --my-sessions-only, mask all kernel IDs in cluster launch timeout logs
+            # to preserve peer privacy and prevent leaking other users' session IDs
             if my_sessions_only and scoped_user:
                 kernel_ids.append(f"{k_id[:8]}...[masked]")
             else:

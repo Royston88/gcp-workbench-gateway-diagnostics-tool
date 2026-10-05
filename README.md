@@ -122,20 +122,19 @@ You can execute the diagnostic suite using any of three methods, ranging from ze
 
 ### Option A: Zero-Install Standalone Executable (`.pyz`) (Recommended / Fastest)
 
-The entire diagnostic tool is packaged as a single-file executable Python zipapp (`dataproc_gateway_diagnostics.pyz`). It requires **zero package installations, zero compilers, and zero virtual environments** — only Python 3.8+ (which is pre-installed on Vertex AI Workbench VMs, Cloud Shell, Cloudtop, and standard Linux workstations):
+The entire diagnostic tool can be packaged as a single-file executable Python zipapp (`dataproc_gateway_diagnostics.pyz`). It requires **zero package installations, zero compilers, and zero virtual environments** — only Python 3.8+ (which is pre-installed on Vertex AI Workbench VMs, Cloud Shell, Cloudtop, and standard Linux workstations):
 
 ```bash
-# 1. Download the standalone executable zipapp from GitHub Releases
-curl -sSL -o dataproc_gateway_diagnostics.pyz \
-    https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool/releases/latest/download/dataproc_gateway_diagnostics.pyz
+# 1. Build the standalone binary from clean source (takes ~1 second):
+python3 scripts/build_zipapp.py
 
-# (Optional) Verify SHA-256 against release notes, or build locally from clean source:
-# python3 scripts/build_zipapp.py
-
-# 2. Run directly with Python (outside or inside Workbench)
+# 2. Run directly with Python (outside or inside Workbench):
 python3 dataproc_gateway_diagnostics.pyz diagnose \
     --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 ```
+
+> [!NOTE]
+> Pre-built binary downloads via GitHub Releases (`https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool/releases/latest/download/dataproc_gateway_diagnostics.pyz`) will be attached to release tags on merge. Until then, `python3 scripts/build_zipapp.py` generates the clean `.pyz` locally.
 
 ### Option B: Local Git Clone / Pip Install
 

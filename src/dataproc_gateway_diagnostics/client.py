@@ -301,6 +301,21 @@ def resolve_active_account() -> str:
         return ""
 
 
+def _redact_proxy(value: str) -> str:
+    """Redacts credentials (user:password) from a proxy URL for safe display."""
+    if not value:
+        return value
+    try:
+        p = urllib.parse.urlsplit(value)
+        if p.username or p.password:
+            host = p.hostname or ""
+            port = f":{p.port}" if p.port else ""
+            return f"{p.scheme}://***@{host}{port}"
+    except Exception:
+        pass
+    return value
+
+
 class GatewayDiagnosticClient:
     """Read-only client for Dataproc, YARN ResourceManager and Cloud Logging."""
 
@@ -396,13 +411,17 @@ class GatewayDiagnosticClient:
 
         return False
 
+    def _job_allowed(self) -> bool:
+        """Returns True only if the caller explicitly opted into in-cluster job execution."""
+        return self.transport == "spark-job" or (
+            self.transport == "auto" and self.allow_job_submission
+        )
+
     def _handle_gateway_fallback(self, exc: Exception, action_name: str) -> None:
         """Determines whether to fall back to an in-cluster PySpark job or raise guidance."""
         if self._is_network_error(exc):
-            self._gateway_unreachable = True
-            if self.transport == "spark-job" or (
-                self.transport == "auto" and self.allow_job_submission
-            ):
+            if self._job_allowed():
+                self._gateway_unreachable = True
                 return
             hint_flag = (
                 "--transport=spark-job"
@@ -550,7 +569,7 @@ class GatewayDiagnosticClient:
 
 
         err_text = (out.stderr or out.stdout or "Unknown error").strip()
-        if "403" in err_text or "Permission" in err_text or "does not have" in err_text:
+        if "PERMISSION_DENIED" in err_text:
             raise AccessDenied(
                 f"In-cluster PySpark fallback denied: {err_text[:280]}",
                 required_roles=[
@@ -704,7 +723,7 @@ class GatewayDiagnosticClient:
         return self._get_json(f"{base}/{path.lstrip('/')}")
 
     def yarn_metrics(self) -> Dict[str, Any]:
-        if self.transport == "spark-job" or self._gateway_unreachable:
+        if self.transport == "spark-job" or (self._gateway_unreachable and self._job_allowed()):
             snap = self._get_master_snapshot()
             if "yarn_metrics" in snap.get("errors", {}) and not snap.get("yarn_metrics"):
                 raise DiagnosticError(snap["errors"]["yarn_metrics"])
@@ -718,7 +737,7 @@ class GatewayDiagnosticClient:
             raise
 
     def yarn_scheduler(self) -> Dict[str, Any]:
-        if self.transport == "spark-job" or self._gateway_unreachable:
+        if self.transport == "spark-job" or (self._gateway_unreachable and self._job_allowed()):
             snap = self._get_master_snapshot()
             if "yarn_scheduler" in snap.get("errors", {}) and not snap.get("yarn_scheduler"):
                 raise DiagnosticError(snap["errors"]["yarn_scheduler"])
@@ -734,7 +753,7 @@ class GatewayDiagnosticClient:
             raise
 
     def yarn_apps(self, states: str = "RUNNING,ACCEPTED") -> List[Dict[str, Any]]:
-        if self.transport == "spark-job" or self._gateway_unreachable:
+        if self.transport == "spark-job" or (self._gateway_unreachable and self._job_allowed()):
             snap = self._get_master_snapshot()
             raw_apps = snap.get("yarn_apps", []) or []
             if states:
@@ -769,7 +788,7 @@ class GatewayDiagnosticClient:
         return self._endpoint("jupyter", "gateway") or self._endpoint("kernel", "gateway")
 
     def kernels(self) -> List[Dict[str, Any]]:
-        if self.transport == "spark-job" or self._gateway_unreachable:
+        if self.transport == "spark-job" or (self._gateway_unreachable and self._job_allowed()):
             snap = self._get_master_snapshot()
             if "kernels" in snap.get("errors", {}) and not snap.get("kernels"):
                 raise DiagnosticError(snap["errors"]["kernels"])
@@ -1123,13 +1142,13 @@ class GatewayDiagnosticClient:
         proxy_parts = []
         https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if https_proxy:
-            proxy_parts.append(f"HTTPS_PROXY={https_proxy}")
+            proxy_parts.append(f"HTTPS_PROXY={_redact_proxy(https_proxy)}")
         http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
         if http_proxy:
-            proxy_parts.append(f"HTTP_PROXY={http_proxy}")
+            proxy_parts.append(f"HTTP_PROXY={_redact_proxy(http_proxy)}")
         no_proxy = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
         if no_proxy:
-            proxy_parts.append(f"NO_PROXY={no_proxy}")
+            proxy_parts.append(f"NO_PROXY={_redact_proxy(no_proxy)}")
         if proxy_parts:
             context["proxy_env"] = ", ".join(proxy_parts)
             context["display"] += f" [{context['proxy_env']}]"
