@@ -116,11 +116,27 @@ gcloud projects add-iam-policy-binding <PROJECT_ID> \
 
 ---
 
-## Step 2 — Install
+## Step 2 — Install & Execution Options
 
-The tool can be installed either in an external terminal (Cloud Shell, Cloudtop, local workstation, CI/CD) or directly within a Vertex AI Workbench environment.
+You can execute the diagnostic suite using any of three methods, ranging from zero-install single-file execution to standard editable python package installs:
 
-### Option A: External Terminal / Cloud Shell / Local Workstation
+### Option A: Zero-Install Standalone Executable (`.pyz`) (Recommended / Fastest)
+
+The entire diagnostic tool can be packaged as a single-file executable Python zipapp (`dataproc_gateway_diagnostics.pyz`). It requires **zero package installations, zero compilers, and zero virtual environments** — only Python 3.8+ (which is pre-installed on Vertex AI Workbench VMs, Cloud Shell, Cloudtop, and standard Linux workstations):
+
+```bash
+# 1. Build the standalone binary from clean source (takes ~1 second):
+python3 scripts/build_zipapp.py
+
+# 2. Run directly with Python (outside or inside Workbench):
+python3 dataproc_gateway_diagnostics.pyz diagnose \
+    --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+```
+
+> [!NOTE]
+> Pre-built binary downloads via GitHub Releases (`https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool/releases/latest/download/dataproc_gateway_diagnostics.pyz`) will be attached to release tags on merge. Until then, `python3 scripts/build_zipapp.py` generates the clean `.pyz` locally.
+
+### Option B: Local Git Clone / Pip Install
 
 ```bash
 git clone https://github.com/Royston88/gcp-workbench-gateway-diagnostics-tool.git
@@ -128,7 +144,7 @@ cd gcp-workbench-gateway-diagnostics-tool
 pip install --no-deps -e .
 ```
 
-### Option B: Vertex AI Workbench (Notebook Cell or Terminal)
+### Option C: In-Situ Vertex AI Workbench (Notebook Cell or Terminal)
 
 Run this directly **in a notebook cell**:
 
@@ -141,7 +157,18 @@ import sys
 > [!IMPORTANT]
 > When installing inside Workbench notebooks, use `{sys.executable}`, not a bare `pip`. On Vertex AI Workbench the JupyterLab **server** runs in `/opt/micromamba/envs/jupyterlab` while the notebook **kernel** runs `/opt/micromamba/bin/python3`. A bare `pip install` frequently targets the server environment, and the tool then fails inside cells with `FileNotFoundError: 'gateway-diag'`. `{sys.executable}` always resolves to the interpreter actually executing your cell.
 
-`--no-deps` guarantees pip cannot upgrade, downgrade, or overwrite any existing Google Cloud library. The package has a single dependency, `google-auth`, already present in modern Google Cloud environments.
+### Option D: In-Cluster PySpark Probe (`--transport=spark-job`)
+
+If running from an air-gapped environment or locked-down jumpbox where Component Gateway (`*.dataproc.googleusercontent.com`) is unreachable over the network, execute with `--transport=spark-job`:
+
+```bash
+gateway-diag diagnose \
+    --cluster=<CLUSTER> \
+    --region=<REGION> \
+    --transport=spark-job
+```
+
+This bypasses Component Gateway HTTPS entirely by executing a single-shot in-cluster PySpark diagnostic probe (`spark.master=local[1]`) that queries YARN RM metrics, CapacityScheduler limits, active/queued apps, local Kernel Gateway sessions, and gateway logs directly from the master VM loopback.
 
 ---
 
@@ -152,11 +179,11 @@ import sys
 Run from an external terminal, Cloud Shell, Cloudtop, or CI/CD to inspect all cluster sessions, cross-VM disambiguation signals, and multi-tenant AM allocation:
 
 ```bash
-# Using the console script directly:
-gateway-diag diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+# Using the standalone .pyz binary:
+python3 dataproc_gateway_diagnostics.pyz diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 
-# Or via Python module:
-python3 -m dataproc_gateway_diagnostics diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
+# Or via installed console script:
+gateway-diag diagnose --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER>
 ```
 
 ### Option B: Regular Data Scientist (Personal Scoped Audit)
@@ -168,10 +195,20 @@ import sys
 PY = sys.executable
 
 # Personal scoped diagnosis (zero peer noise, zero permission errors):
-!{PY} -m dataproc_gateway_diagnostics diagnose \
+!{PY} dataproc_gateway_diagnostics.pyz diagnose \
     --project=<PROJECT> --region=<REGION> --cluster=<CLUSTER> \
     --my-sessions-only
 ```
+
+### Transport Modes (`--transport`)
+
+The tool supports three diagnostic transport mechanisms:
+
+| Flag Value | Mode | Description |
+|---|---|---|
+| `--transport=auto` *(default)* | **Hybrid Auto-Fallback** | Attempts Method 1 (Component Gateway HTTPS). If Component Gateway is unreachable (`[Errno 101] Network is unreachable`, air-gapped private VPC lacking Anycast VIP route, or Knox `HTTP 500 Service connectivity error`), automatically falls back to Method 2. |
+| `--transport=gateway` | **Component Gateway HTTPS** | Queries reverse-proxy endpoints (`https://<hash>.dataproc.googleusercontent.com/...`) for Kernel Gateway and YARN RM. |
+| `--transport=spark-job` | **In-Cluster PySpark Job** | Submits a single non-intrusive `spark.master=local[1]` PySpark job to query master-local loopback endpoints (`127.0.0.1:8888`, `https://localhost:8090`, and `/var/log/jupyter_kernel_gateway.log`) in ~10 seconds. |
 
 > [!TIP]
 > Run it **while the problem is occurring**. Checks 1 and 2 read live YARN state; on an idle cluster they will legitimately pass even if the cluster fails under load.
@@ -188,15 +225,25 @@ Tool Version   : 0.2.0
 Target Cluster : pyspark-cluster-dev-multitenant
 Cluster State  : RUNNING
 Image Version  : 2.3.36-debian12
+Transport Mode : Method 1: Component Gateway HTTPS
 -----------------------------------------------------------------
 
 [CHECK 2] YARN ApplicationMaster Capacity
-   -> maximum-am-resource-percent   : 0.8 (recommended >= 0.8)
-   -> AM memory used / limit        : 0 MB / 41.3 GB  (0.0%)
+   -> Scheduler                     : capacityScheduler
+   -> Queue examined                : default (capacity: 100.0%, absolute: 100.0%)
+   -> maximum-am-resource-percent   : 80.0% (0.8) (recommended >= 80.0% / 0.8)
+   -> AM memory used / limit        : 0 MB / 41.3 GB (42317 MB)  (0.0%)
+   -> User AM resource limit        : 41.3 GB (42317 MB)
    -> Applications ACTIVE           : 0
    -> Applications PENDING (ACCEPTED): 0
-   -> Cluster memory                : 0 MB used / 51.7 GB total  (51.7 GB free)
+   -> Queued App Diagnostics        : None (no applications currently queued in ACCEPTED)
+   -> Active queue user(s)          : None (0 active users in queue)
+   -> Cluster memory                : 0 MB used / 51.7 GB (52896 MB) total  (51.7 GB (52896 MB) free)
+   -> maxApplications / per user    : 10000 / 10000
+   -> userLimitFactor               : 1.0
    -> Verdict                       : [✓] PASS
+      ApplicationMaster budget 0.0% consumed, 0 application(s)
+      pending. No starvation detected.
 
 =================================================================
                              SUMMARY
@@ -220,17 +267,21 @@ Exit code `0`. All four causes ruled out — look elsewhere (networking, image, 
 ```
 [CHECK 2] YARN ApplicationMaster Capacity
    -> Scheduler                     : capacityScheduler
-   -> Queue examined                : default
-   -> maximum-am-resource-percent   : 0.1 (recommended >= 0.8)
-   -> AM memory used / limit        : 2.4 GB / 2.5 GB  (96.3%)
+   -> Queue examined                : default (capacity: 100.0%, absolute: 100.0%)
+   -> maximum-am-resource-percent   : 10.0% (0.1) (recommended >= 80.0% / 0.8)
+   -> AM memory used / limit        : 2.4 GB (2458 MB) / 2.5 GB (2560 MB)  (96.0%)
+   -> User AM resource limit        : 2.5 GB (2560 MB)
    -> Applications ACTIVE           : 1
    -> Applications PENDING (ACCEPTED): 5
-   -> Active queue user(s)          : ds-user-1-svc (1 app(s), AM: 2.4 GB)
-   -> Cluster memory                : 8.5 GB used / 24.7 GB total  (16.1 GB free)
+   -> Queued App Diagnostics        :
+      * App [1] application_1727654321_0002 (user: ds_user_2):
+        YARN Diagnostics: Application is added to the scheduler and is not yet activated. Queue's AM resource limit exceeded.
+   -> Active queue user(s)          : ds-user-1-svc (1 active, 0 pending, AM: 2.4 GB (2458 MB)), ds-user-2-svc (0 active, 5 pending, AM: 0 MB)
+   -> Cluster memory                : 8.5 GB (8704 MB) used / 24.7 GB (25292 MB) total  (16.1 GB (16588 MB) free)
    -> Verdict                       : [✗] FAIL
       AM STARVATION CONFIRMED: applications are queued in
-      ACCEPTED while 16.1 GB of cluster memory is still free. The
-      ApplicationMaster budget is 96.3% consumed.
+      ACCEPTED while 16.1 GB (16588 MB) of cluster memory is still free. The
+      ApplicationMaster budget is 96.0% consumed.
 
 =================================================================
    Check 2  YARN ApplicationMaster Capacity  : [✗] FAIL   <-- PRIMARY ROOT CAUSE
@@ -270,8 +321,8 @@ Region ID         : us-central1
 Target Cluster    : pyspark-cluster-e2e-20260915-v5
 Cluster State     : RUNNING
 Image Version     : 2.3.36-debian12
-Active Account    : admin@kenly.altostrat.com
-Execution Context : External GCE VM (Outside Workbench: kenly, Zone: asia-southeast1-b)
+Active Account    : admin@example.com
+Execution Context : External GCE VM (Outside Workbench: user, Zone: us-central1-a)
 -----------------------------------------------------------------
 [PRE-FLIGHT] IAM Permissions & Diagnostic Capabilities
    -> Core Diagnostic Checks     : [✓] FULL (Checks 1, 2, 3, 4 ready)
@@ -303,7 +354,7 @@ Execution Context : External GCE VM (Outside Workbench: kenly, Zone: asia-southe
 
    -> [Kernel] 05a855ac...          : pyspark_yarn
       * Workbench VM                : instance-20260901-162000-single-svc (ACTIVE) (100% confidence via Signal 1 Guest Attributes, Signal 2 Serial Trace, Signal 3 Cloud Monitoring) [Alternative: instance-20251203-071523-single-svc, instance-20251120-225315-single-svc]
-      * Workbench Owner             : ds_user_1@kenly.altostrat.com
+      * Workbench Owner             : user@example.com
       * Notebook File               : Dataproc_Gateway_Diagnostics.ipynb
       * Workbench UI ID             : [Unresolved] (Local sidebar session UUID; requires in-situ execution or Method 1/2 remote exec)
       * State                       : idle (idle for 1h 36m)
@@ -483,14 +534,55 @@ gateway-diag diagnose --cluster=<CLUSTER> --json > gateway_audit.json
 
 ---
 
-## Troubleshooting
+## Troubleshooting & Known Operational Errors
 
-| Symptom | Cause | Fix |
+### Quick Diagnostic Matrix
+
+| Symptom | Primary Cause | Immediate Fix |
 |---|---|---|
-| `FileNotFoundError: 'gateway-diag'` | Installed into a different environment than the kernel | Reinstall with `{sys.executable}` (Step 2) |
-| `[?] SKIPPED` on Checks 1/2 | Component Gateway disabled, or missing `dataproc.clusters.use` | Verify Step 1; grant the role the tool prints |
-| `[?] SKIPPED` on Check 3 | Missing `roles/logging.viewer` | Grant it, or ignore — Check 3 is corroborating only |
-| Everything passes but kernels still fail | Run happened while the cluster was idle | Re-run **during** the failure |
+| **`[Errno 101] Network is unreachable`**<br>`Network error for https://<hash>.dataproc.googleusercontent.com/...` | Private/air-gapped VPC lacks routes for public Anycast IPs used by `*.dataproc.googleusercontent.com` | **Use `--transport=spark-job`** (or `--allow-job-submission`) to read master loopback via in-cluster PySpark job; or add Cloud DNS Private Zone for `dataproc.googleusercontent.com.` (see details below). |
+| **Check 3 `[?] SKIPPED`**<br>`Request is prohibited by organization's policy. vpcServiceControlsUniqueIdentifier: ...` | VPC Service Controls (VPC-SC) blocks `logging.googleapis.com` from the executing identity | **Use `--transport=spark-job`** to inspect master local `/var/log/jupyter_kernel_gateway.log` with zero Cloud Logging API calls. |
+| **`pip install` fails offline**<br>`Could not find a version that satisfies the requirement` | Locked-down / air-gapped Workbench VM without public PyPI egress | **Use the standalone `.pyz` binary** (`dataproc_gateway_diagnostics.pyz`), which has zero dependencies and requires no pip install. |
+| **`HTTP 500 Service connectivity error`**<br>`java.io.IOException: Service connectivity error` from Knox | Component Gateway's Knox reverse-proxy lost transient connection to YARN RM | **Use `--transport=spark-job`** to query YARN RM directly on the master node loopback (`https://localhost:8090`). |
+| **`FileNotFoundError: 'gateway-diag'`** in notebook cell | `pip` installed the package into the JupyterLab server env rather than the notebook kernel env | Reinstall using `{sys.executable} -m pip install --no-deps -e ...` (see Step 2 Option C), or execute the standalone `.pyz` directly. |
+| **`[?] SKIPPED` on Checks 1 and 2** | Component Gateway disabled, or caller lacks `dataproc.clusters.use` | Verify Step 1 (`enableHttpPortAccess: True`); grant `roles/dataproc.editor` or custom `DataprocGatewayUser` role. |
+| **All checks pass, but kernels still fail** | Diagnostic was executed while the cluster was idle | Re-run the diagnostic **during peak hours while kernel launch failures are actively occurring**. Live YARN state resets once orphaned drivers are killed or cluster restarts. |
+
+---
+
+### Deep Dive: Resolving Air-Gapped VPC & Private Google Access Errors
+
+#### 1. `[Errno 101] Network is unreachable` on Component Gateway (`*.dataproc.googleusercontent.com`)
+
+**The Root Cause:**  
+On private Google Cloud VPCs without Cloud NAT or internet gateways, standard Private Google Access (PGA) only resolves and routes Google API domains (`*.googleapis.com`). Dataproc Component Gateway URLs reside under `*.dataproc.googleusercontent.com`, which resolves to public Anycast IPs (`173.194.206.132` / `34.x.x.x`). Because private subnets lack a `0.0.0.0/0` default internet gateway route, connection attempts from Workbench VMs immediately fail with `[Errno 101] Network is unreachable`.
+
+**Resolution Options:**
+* **Option A (Zero Infrastructure Change — Tool v0.2.0+):**  
+  Execute the diagnostic tool using `--transport=spark-job` (or pass `--allow-job-submission`). The tool routes through an in-cluster PySpark job (`spark.master=local[1]`) that reads master loopback `127.0.0.1:8888` and `https://localhost:8090` without touching Component Gateway.
+* **Option B (Permanent VPC Route / DNS Fix for Interactive Notebooks):**  
+  If interactive JupyterLab notebooks must connect to remote Dataproc kernels via Component Gateway from this private VPC, configure Cloud DNS and routing for the Restricted VIP:
+  1. Create a **Cloud DNS Private Zone** for `dataproc.googleusercontent.com.` in your VPC.
+  2. Add a wildcard CNAME record: `*.dataproc.googleusercontent.com.` -> `restricted.googleapis.com.` (or `private.googleapis.com.`).
+  3. Ensure a custom route exists in your VPC routing `199.36.153.4/30` (Restricted VIP) to the `default-internet-gateway` next hop.
+* **Option C (Subshell Proxy Inheritance):**  
+  If your Workbench VM accesses external endpoints through an enterprise HTTP proxy, notebook cell bash subshells (`!`) do not automatically inherit shell environment variables. Run:
+  ```bash
+  !https_proxy=$https_proxy http_proxy=$http_proxy python3 dataproc_gateway_diagnostics.pyz diagnose --cluster=<CLUSTER>
+  ```
+
+#### 2. VPC Service Controls (VPC-SC) Blocking Cloud Logging (Check 3)
+
+**The Root Cause:**  
+Regulated enterprise environments often enforce VPC Service Controls on `logging.googleapis.com`. When the diagnostic tool attempts to query Cloud Logging via `entries:list` from a Workbench VM whose service account lacks perimeter ingress authorization, Google's API gateway rejects the call:
+```text
+HTTP 403: Request is prohibited by organization's policy. vpcServiceControlsUniqueIdentifier: G6u-...
+```
+
+**Resolution Options:**
+* **Option A (In-Cluster Log Fallback — `--transport=spark-job`):**  
+  When `--transport=spark-job` is explicitly specified (or `--allow-job-submission` is passed), the tool inspects the master VM's physical log file (`/var/log/jupyter_kernel_gateway.log`), extracting launch timeout exceptions directly without calling Cloud Logging.
+
 
 ---
 
