@@ -140,7 +140,9 @@ try:
             entries = []
             ts_re = re.compile(r"^\\[[IWEFD]\\s+(\\d{2})(\\d{2})(\\d{2})\\s+(\\d{2}:\\d{2}:\\d{2})")
             for line in f:
-                if any(w in line.lower() for w in ("launch timeout", "timeouterror", "500 post /api/kernels", "error starting kernel", "failed to start kernel")):
+                # Only "launch timeout" lines are counted by Check 3; matching more
+                # patterns here would only use up the 200-entry cap below.
+                if "launch timeout" in line:
                     m_ts = ts_re.match(line)
                     if m_ts:
                         yy, mm, dd, hms = m_ts.groups()

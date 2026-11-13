@@ -416,7 +416,7 @@ Reading it line by line:
 |---|---|
 | **Check 1 FAIL** — idle kernels holding AMs | • **On running clusters:** Shut down idle kernels via JupyterLab (*Running Terminals and Kernels*) or kill orphaned YARN applications via master-local job (see below).<br>• **At cluster creation:** Enforce YARN application lifetime reaping (`yarn:yarn.resourcemanager.app.max-lifetime=86400`). *(Note: Dataproc multi-tenant clusters do not enforce OS daemon culling via cluster properties or init actions; see [Appendix B: Multi-Tenant Architectural Constraints](#appendix-b-multi-tenant-architectural-constraints) below).* |
 | **Check 2 FAIL** — AM starvation | Raise the AM budget: `--properties='capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent=0.8'` *(Required at creation time; cannot be modified on running clusters).* |
-| **Check 3 FAIL** — launch timeouts | • **On running clusters:** Resolve Check 2 (AM capacity) first; launch timeouts are almost always downstream symptoms of AM queuing rather than slow container starts.<br>• **At cluster creation:** Configure higher launch timeout if custom container environments require longer cold starts. *(Cannot be modified on running clusters).* |
+| **Check 3 FAIL** — launch timeouts | • **On running clusters:** Resolve Check 2 (AM capacity) first; launch timeouts are almost always downstream symptoms of AM queuing rather than slow container starts.<br>• **Slow driver start-up:** If Check 2 is healthy, find what delays Spark driver start-up (Java agents, heavy classpath, dependency localisation). The 120 s launch timeout is fixed in the Dataproc kernelspec and no cluster property changes it. Raising it requires a custom image. |
 | **Check 4 WARN** — concurrency ceiling too low | Lower `spark.driver.memory`, raise `maximum-am-resource-percent`, or add workers. |
 
 ### How to Deal with Idle Sessions on Running Clusters
@@ -777,7 +777,7 @@ This appendix documents critical Google Cloud Dataproc architectural constraints
 > Multi-tenant Dataproc clusters automatically enforce **Hermetic VM Isolation** (`hermetic-vm: 'true'` and `block-project-ssh-keys: 'true'`), which disables the SSH daemon (`Connection refused` on port 22). In addition, Dataproc Component Gateway reverse-proxy blocks HTTP `PUT` requests (`405 Method Not Allowed`) to the YARN ResourceManager REST API, and Dataproc jobs execute as unprivileged user `admin` without passwordless `sudo` privileges.  
 >  
 > **What this means in practice:**  
-> * **Jupyter Kernel Launch Timeouts** (`default_kernel_launch_timeout`) **CANNOT** be edited on a running cluster.  
+> * **Jupyter Kernel Launch Timeout** (120 s, set by the Dataproc image in each YARN kernelspec at `kernel.json` → `metadata.kernel_provisioner.config.launch_timeout`) **CANNOT** be changed through any Dataproc property, gateway config setting or environment variable. Changing it requires a custom image.  
 > * **YARN Application Lifetime Reaper** (`yarn:yarn.resourcemanager.app-lifetime-monitor.*`) **CANNOT** be enabled or modified on a running cluster.  
 > * **YARN AM Resource Limits** (`maximum-am-resource-percent`) **CANNOT** be changed on a running cluster.  
 >  

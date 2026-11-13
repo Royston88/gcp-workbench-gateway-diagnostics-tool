@@ -42,6 +42,50 @@ AM_SATURATION_WARN = 0.70
 # diagnostic of an admission-control limit rather than genuine exhaustion.
 FREE_MEMORY_SIGNIFICANT_MB = 8 * 1024
 
+# Kernel launch timeout on Dataproc. The image's Kernel Gateway activation script
+# hard-codes LAUNCH_TIMEOUT_SECONDS=120 and writes it into each YARN kernelspec
+# (kernel.json -> metadata.kernel_provisioner.config.launch_timeout). jupyter_client
+# passes kernelspec provisioner config as constructor kwargs, which override both
+# c.YarnProvisioner.launch_timeout and the KERNEL_LAUNCH_TIMEOUT/GP_LAUNCH_TIMEOUT
+# env defaults. There is no Dataproc cluster property for it.
+DATAPROC_KERNEL_LAUNCH_TIMEOUT_S = 120
+LAUNCH_TIMEOUT_NOT_CONFIGURABLE_NOTE = (
+    f"The {DATAPROC_KERNEL_LAUNCH_TIMEOUT_S}s kernel launch timeout is set in the Dataproc "
+    "kernelspec (.../share/jupyter/kernels/pyspark_yarn/kernel.json -> "
+    "metadata.kernel_provisioner.config.launch_timeout). No Dataproc property, gateway "
+    "config setting or environment variable changes it. On secure multi-tenant clusters "
+    "(no SSH, no initialization actions), a custom image is the only way to raise it."
+)
+
+# Recommended floor for yarn.scheduler.capacity.maximum-am-resource-percent on
+# Kernel Gateway clusters, where every kernel is a cluster-mode Spark driver (AM).
+RECOMMENDED_MAX_AM_PERCENT = 80.0
+
+
+def _am_limit_exceeded_diagnosis(max_am_pct: Optional[float]) -> str:
+    """Remediation text for an app refused with 'AM resource limit exceeded'."""
+    head = (
+        "Queue AM capacity starvation: YARN will not start this driver container because the "
+        "queue's ApplicationMaster limit is used up."
+    )
+    prop = "capacity-scheduler:yarn.scheduler.capacity.maximum-am-resource-percent"
+    recreate = "This is a create-time property: recreate the cluster to change it."
+    if max_am_pct is None:
+        return (
+            f"{head} Current limit unknown. Remediation: make sure {prop} is at least "
+            f"{RECOMMENDED_MAX_AM_PERCENT / 100:g}. {recreate}"
+        )
+    if max_am_pct < RECOMMENDED_MAX_AM_PERCENT:
+        return (
+            f"{head} Current limit is {max_am_pct:.1f}%. Remediation: raise {prop} to "
+            f"{RECOMMENDED_MAX_AM_PERCENT / 100:g} or higher. {recreate}"
+        )
+    return (
+        f"{head} The limit is already {max_am_pct:.1f}%, so raising it further is unlikely to "
+        "help. Remediation: free AM capacity by shutting down idle kernels and killing "
+        "orphaned YARN applications (see Check 1), or add worker capacity."
+    )
+
 
 # ----------------------------------------------------------------------
 # helpers
@@ -1065,16 +1109,17 @@ def check_am_capacity(
             if "waiting for am container to register with rm" in diag_lower:
                 result.add(
                     "  * Root Cause Diagnosis",
-                    "AM container process was successfully launched on worker node, but the Spark driver JVM has not "
-                    "yet registered back with ResourceManager. If JVM initialization takes >120s (e.g. OpenTelemetry bytecode "
-                    "instrumentation or classloading delays), Kernel Gateway aborts with HTTP 500 'Error Starting Kernel'. "
-                    "Remediation: increase GatewayProvisionerBase.default_kernel_launch_timeout=600.",
+                    "The AM container was launched on a worker node, but the Spark driver has not yet registered "
+                    "with the ResourceManager. If driver start-up (JVM, SparkContext, Java agents, classpath or "
+                    "dependency localisation) takes longer than the gateway's "
+                    f"{DATAPROC_KERNEL_LAUNCH_TIMEOUT_S}s launch timeout, Kernel Gateway aborts with HTTP 500 "
+                    "'Error Starting Kernel'. Remediation: find and remove the slow start-up step. "
+                    + LAUNCH_TIMEOUT_NOT_CONFIGURABLE_NOTE,
                 )
             elif "am resource limit exceeded" in diag_lower:
                 result.add(
                     "  * Root Cause Diagnosis",
-                    "Queue AM capacity starvation: YARN cannot allocate the driver container because maximum-am-resource-percent "
-                    "is exhausted. Remediation: increase maximum-am-resource-percent to 0.8.",
+                    _am_limit_exceeded_diagnosis(max_am_pct),
                 )
     else:
         result.add(
@@ -1236,9 +1281,11 @@ def check_launch_timeouts(
         matched += 1
         if latest is None:
             latest = entry.get("timestamp", "")
-        found = re.search(r"launch timeout:\s*(\d+)", text)
+        found = re.search(r"launch timeout:\s*(\d+(?:\.\d+)?)", text)
         if found:
-            timeout_values.append(int(found.group(1)))
+            # gateway_provisioners can log a float here (it subtracts queue-poll
+            # time when KERNEL_QUEUE/KERNEL_NODE_LABEL are set); round to whole seconds.
+            timeout_values.append(int(round(float(found.group(1)))))
         kernel = re.search(r"KernelID:\s*'([^']+)'", text)
         if kernel:
             k_id = kernel.group(1)
@@ -1256,7 +1303,11 @@ def check_launch_timeouts(
     result.add("Timeout events found", matched)
     result.add(
         "Effective launch timeout",
-        f"{effective_timeout}s" if effective_timeout else "not observed (default 120s)",
+        (
+            f"{effective_timeout}s (as logged by the gateway)"
+            if effective_timeout
+            else f"not observed (Dataproc kernelspec default {DATAPROC_KERNEL_LAUNCH_TIMEOUT_S}s)"
+        ),
     )
     result.add("Distinct kernels affected", len(unique_kernels))
     if latest:
@@ -1277,11 +1328,9 @@ def check_launch_timeouts(
             "Each one surfaces to the user as HTTP 500 'Error Starting Kernel'."
         )
         result.remediation = [
-            "Raise the provisioner timeout to 600s "
-            "(GatewayProvisionerBase.default_kernel_launch_timeout=600, "
-            "or export KERNEL_LAUNCH_TIMEOUT=600).",
-            "Fix the underlying admission limit first -- a longer timeout only "
-            "masks the queueing reported by Check 2.",
+            "Fix what delays kernel start-up first: the admission limit or queueing reported "
+            "by Check 2, or slow Spark driver initialisation. A longer timeout only masks it.",
+            LAUNCH_TIMEOUT_NOT_CONFIGURABLE_NOTE,
         ]
     else:
         result.status = Status.PASS
