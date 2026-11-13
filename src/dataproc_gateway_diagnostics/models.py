@@ -99,6 +99,7 @@ class GatewayDiagnosticReport:
     generated_at: str = ""
     execution_context: Dict[str, Any] = field(default_factory=dict)
     iam_capabilities: Dict[str, Any] = field(default_factory=dict)
+    transport_mode: str = ""
     my_sessions_only: bool = False
     scoped_user: Optional[str] = None
     total_cluster_kernels: int = 0
@@ -137,6 +138,7 @@ class GatewayDiagnosticReport:
             "cluster_state": self.cluster_state,
             "image_version": self.image_version,
             "active_account": self.active_account,
+            "transport_mode": self.transport_mode,
             "execution_context": self.execution_context,
             "iam_capabilities": self.iam_capabilities,
             "my_sessions_only": self.my_sessions_only,

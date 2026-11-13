@@ -100,6 +100,7 @@ def build_report(
         my_sessions_only=my_sessions_only,
         scoped_user=scoped_user,
     )
+    report.transport_mode = getattr(client, "active_transport", "")
     for check in report.checks:
         if check.check_id == 1 and check.metrics:
             report.total_cluster_kernels = check.metrics.get("total_cluster_kernels", 0)
@@ -125,6 +126,8 @@ def render_text(report: GatewayDiagnosticReport) -> str:
         lines.append(f"Image Version     : {report.image_version}")
     if report.active_account:
         lines.append(f"Active Account    : {report.active_account}")
+    if report.transport_mode:
+        lines.append(f"Transport Mode    : {report.transport_mode}")
     if report.execution_context and report.execution_context.get("display"):
         lines.append(f"Execution Context : {report.execution_context['display']}")
     if report.my_sessions_only:
@@ -250,7 +253,10 @@ def render_text(report: GatewayDiagnosticReport) -> str:
                 step += 1
         lines.append(RULE)
     else:
-        lines.append(_center("No action required."))
+        if report.overall_status in (Status.ERROR, Status.SKIPPED):
+            lines.append(_center("Review error details above."))
+        else:
+            lines.append(_center("No action required."))
         lines.append(RULE)
 
     return "\n".join(lines)
@@ -364,6 +370,31 @@ Examples:
         action="store_true",
         help="Filter diagnostic output to only show the calling user's sessions and YARN applications.",
     )
+    parser.add_argument(
+        "--transport",
+        default="gateway",
+        choices=["gateway", "auto", "spark-job"],
+        help=(
+            "Data collection transport: 'gateway' (default: Method 1 Component Gateway HTTPS), "
+            "'spark-job' (Method 2 In-Cluster PySpark local[1] job), or 'auto' "
+            "(Method 1 with optional automatic fallback to Method 2 if --allow-job-submission is set)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-job-submission",
+        action="store_true",
+        help=(
+            "Allow automatic in-cluster PySpark job submission fallback when Component Gateway is unreachable. "
+            "Note: job submission is a write action requiring dataproc.jobs.create and leaves a job history trace."
+        ),
+    )
+    parser.add_argument(
+        "--billing-project",
+        "--user-project",
+        dest="billing_project",
+        default=None,
+        help="Google Cloud project ID to bill for Cloud API calls via the X-Goog-User-Project header.",
+    )
     parser.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds.")
     parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     parser.add_argument("--verbose", action="store_true", help="Log every HTTP request.")
@@ -386,6 +417,9 @@ Examples:
             region=args.region,
             timeout=args.timeout,
             verbose=args.verbose,
+            transport=args.transport,
+            allow_job_submission=args.allow_job_submission,
+            billing_project=args.billing_project,
         )
         report = build_report(
             client,
